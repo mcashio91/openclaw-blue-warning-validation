@@ -1,0 +1,497 @@
+diff --git a/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs b/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
+index 046e67f1..3c14feaf 100644
+--- a/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
++++ b/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
+@@ -6,7 +6,6 @@ using OpenClawTray.Controls;
+ using OpenClawTray.Helpers;
+ using OpenClawTray.Services;
+ using System;
+-using System.Runtime.InteropServices;
+ using System.Threading.Tasks;
+ using WinUIEx;
+ 
+@@ -18,23 +17,12 @@ namespace OpenClawTray.Dialogs;
+ /// Allow Always.
+ ///
+ /// Security posture: the allow buttons are never default-focused and stay disabled for
+-/// a short delay so the dialog cannot be click-through approved; Escape, the X button,
+-/// and Alt+F4 all resolve to Deny.
++/// a short delay so the dialog cannot be click-through approved. Deny and Escape share
++/// that delay. The window opens without activation; X and Alt+F4 remain fail-closed.
+ /// </summary>
+ public sealed class ExecApprovalDialog : WindowEx
+ {
+-    [DllImport("user32.dll")]
+-    private static extern bool SetForegroundWindow(IntPtr hWnd);
+-
+-    [DllImport("user32.dll")]
+-    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+-
+-    private static readonly IntPtr HWND_TOPMOST = new(-1);
+-    private static readonly IntPtr HWND_NOTOPMOST = new(-2);
+-    private const uint SWP_NOMOVE = 0x0002;
+-    private const uint SWP_NOSIZE = 0x0001;
+-
+-    private static readonly TimeSpan AllowArmDelay = TimeSpan.FromMilliseconds(1500);
++    private static readonly TimeSpan DecisionArmDelay = TimeSpan.FromSeconds(3);
+ 
+     private readonly TaskCompletionSource<ExecApprovalPromptOutcome> _tcs =
+         new(TaskCreationOptions.RunContinuationsAsynchronously);
+@@ -63,7 +51,13 @@ public sealed class ExecApprovalDialog : WindowEx
+         var windowTitle = $"{AppIdentity.DisplayName} - {LocalizationHelper.GetString("ExecApproval_WindowTitle")}";
+         Title = windowTitle;
+         this.SetWindowSize(520, 400);
+-        this.CenterOnScreen();
++        // WinUIEx.CenterOnScreen calls SetWindowPos without SWP_NOACTIVATE,
++        // which activates even before Show(false). AppWindow.Move preserves focus.
++        var area = Microsoft.UI.Windowing.DisplayArea.GetFromWindowId(
++            AppWindow.Id, Microsoft.UI.Windowing.DisplayAreaFallback.Nearest).WorkArea;
++        AppWindow.Move(new global::Windows.Graphics.PointInt32(
++            area.X + (area.Width - AppWindow.Size.Width) / 2,
++            area.Y + (area.Height - AppWindow.Size.Height) / 2));
+         this.SetIcon("Assets\\openclaw.ico");
+         SystemBackdrop = new MicaBackdrop();
+         ExtendsContentIntoTitleBar = true;
+@@ -227,52 +221,42 @@ public sealed class ExecApprovalDialog : WindowEx
+             Microsoft.UI.Xaml.Input.KeyboardAcceleratorPlacementMode.Hidden;
+ 
+         Closed += OnWindowClosed;
+-        ArmAllowGuard();
+     }
+ 
+     /// <summary>
+-    /// Activates the window, forces it to the foreground (it opens from a background
+-    /// gateway event), and returns the user's decision. Closing via X or Alt+F4 denies.
++    /// Shows a pending request without taking focus from the user's current application.
++    /// Closing via X or Alt+F4 remains fail-closed, including during the decision delay.
+     /// </summary>
+     public Task<ExecApprovalPromptOutcome> ShowAsync()
+     {
+-        Activate();
+-        try
+-        {
+-            var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+-            if (hwnd != IntPtr.Zero)
+-            {
+-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+-                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+-                SetForegroundWindow(hwnd);
+-            }
+-        }
+-        catch { /* best-effort */ }
+-
+-        // Initial focus lands on Deny so Enter can never approve.
+-        _denyButton.Focus(FocusState.Programmatic);
++        ArmAllowGuard();
++        AppWindow.Show(false);
+         return _tcs.Task;
+     }
+ 
+     private void Decide(ExecApprovalPromptOutcome outcome)
+     {
+-        if (IsClosed) return;
++        if (IsClosed || !_delayElapsed) return;
++        if (outcome != ExecApprovalPromptOutcome.Deny && !_commandFullySeen) return;
+         _outcome = outcome;
+         Close();
+     }
+ 
+     // Anti-clickthrough: allow buttons start disabled and arm only when the delay has
+-    // elapsed AND the whole command has been seen. Deny is always active.
++    // elapsed AND the whole command has been seen. Deny shares the opening delay.
+     private void ArmAllowGuard()
+     {
++        _denyButton.IsEnabled = false;
+         _allowOnceButton.IsEnabled = false;
+         _allowAlwaysButton.IsEnabled = false;
+         MaybeArmAllow();
+-        _armTimer = new DispatcherTimer { Interval = AllowArmDelay };
++        _armTimer = new DispatcherTimer { Interval = DecisionArmDelay };
+         _armTimer.Tick += (_, _) =>
+         {
+             _armTimer?.Stop();
+             _delayElapsed = true;
++            _denyButton.IsEnabled = true;
++            UpdateCommandSeen();
+             MaybeArmAllow();
+         };
+         _armTimer.Start();
+@@ -282,7 +266,9 @@ public sealed class ExecApprovalDialog : WindowEx
+     // before it counts as seen. Once seen it stays seen (scrolling back up is fine).
+     private void UpdateCommandSeen()
+     {
+-        if (_commandFullySeen || _bodyScroll is null) return;
++        // Initial layout may briefly report a fitted viewport before the final
++        // command extent is known. Do not latch that transient measurement.
++        if (!_delayElapsed || _commandFullySeen || _bodyScroll is null) return;
+         // Ignore pre-layout passes: until the ScrollViewer has actually measured its content
+         // (non-zero viewport AND extent), a zero ScrollableHeight means "not laid out yet", not
+         // "everything fits". Latching on that would arm the allow buttons for a long command the
+diff --git a/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs
+new file mode 100644
+index 00000000..b48cebe9
+--- /dev/null
++++ b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs
+@@ -0,0 +1,104 @@
++using System;
++using System.IO;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace OpenClawTray.Services;
++
++internal interface IApprovalNoticeWindow<T>
++{
++    Task Closed { get; }
++    Task<T> ShowAsync();
++    void Close();
++}
++
++// UI-framework-independent seam: all native window operations stay on dispatcher.
++internal static class ApprovalNoticeFlow
++{
++    internal static async Task<T> RunAsync<T>(IApprovalNoticeLease lease,
++        Func<Action, bool> enqueue, Func<IApprovalNoticeWindow<T>> create,
++        CancellationToken cancellationToken, TimeSpan? lifecycleTimeout = null)
++    {
++        var timeout = lifecycleTimeout ?? TimeSpan.FromSeconds(8);
++        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lease.Lost);
++        var token = lifetime.Token;
++        var gate = new object();
++        bool constructing = false, ending = false;
++        IApprovalNoticeWindow<T>? window = null;
++        var shown = new TaskCompletionSource<Task<T>>(TaskCreationOptions.RunContinuationsAsynchronously);
++        var closed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
++        void QueueClose()
++        {
++            // Failed enqueue never implies closure.
++            try
++            {
++                enqueue(() =>
++                {
++                    try { window?.Close(); }
++                    catch { /* Actual Closed remains the only proof. */ }
++                });
++            }
++            catch { /* Dispatcher failure is not confirmed closure. */ }
++        }
++        using var registration = token.Register(QueueClose);
++        try
++        {
++            token.ThrowIfCancellationRequested();
++            if (!enqueue(() =>
++            {
++                lock (gate)
++                {
++                    if (ending || token.IsCancellationRequested)
++                    {
++                        shown.TrySetCanceled();
++                        return;
++                    }
++                    constructing = true;
++                }
++                try
++                {
++                    window = create();
++                    _ = ObserveClosedAsync(window.Closed, closed);
++                    // Recheck after construction: canceled requests never flash.
++                    token.ThrowIfCancellationRequested();
++                    shown.TrySetResult(window.ShowAsync());
++                }
++                catch (Exception ex)
++                {
++                    try { window?.Close(); } catch { }
++                    shown.TrySetException(ex);
++                }
++            })) throw new IOException("Approval UI dispatcher unavailable.");
++            var outcome = await shown.Task.WaitAsync(timeout, token).ConfigureAwait(false);
++            var result = await outcome.WaitAsync(token).ConfigureAwait(false);
++            // Outcome tasks can fault/complete early; Closed is separate evidence.
++            await closed.Task.WaitAsync(timeout, token).ConfigureAwait(false);
++            token.ThrowIfCancellationRequested();
++            return result;
++        }
++        finally
++        {
++            lifetime.Cancel();
++            bool attempted;
++            lock (gate)
++            {
++                ending = true; // Prevents a delayed UI callback from creating a card.
++                attempted = constructing;
++            }
++            if (attempted)
++            {
++                QueueClose();
++                try { await closed.Task.WaitAsync(timeout).ConfigureAwait(false); }
++                catch { lease.Abandon(); }
++            }
++            if (!attempted || closed.Task.IsCompletedSuccessfully)
++                await lease.ReleaseAsync().ConfigureAwait(false);
++        }
++    }
++
++    private static async Task ObserveClosedAsync(Task source, TaskCompletionSource<bool> target)
++    {
++        try { await source.ConfigureAwait(false); target.TrySetResult(true); }
++        catch { /* Faulted show/close is not closure evidence. */ }
++    }
++}
+diff --git a/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeLease.cs b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeLease.cs
+new file mode 100644
+index 00000000..20871ffe
+--- /dev/null
++++ b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeLease.cs
+@@ -0,0 +1,137 @@
++using System;
++using System.Diagnostics;
++using System.IO;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace OpenClawTray.Services;
++
++internal interface IApprovalNoticeLease
++{
++    CancellationToken Lost { get; }
++    Task ReleaseAsync();
++    void Abandon();
++}
++
++// No command text, credentials or decisions enter this process. One stdout reader
++// owns the entire protocol, including ongoing LOST/EOF detection after READY.
++internal sealed class ApprovalNoticeLease : IApprovalNoticeLease
++{
++    private readonly Process _process;
++    private readonly CancellationTokenSource _lost = new();
++    private readonly TaskCompletionSource<bool> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
++    private readonly TaskCompletionSource<bool> _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
++    private int _releaseStarted;
++    private int _disposed;
++    public CancellationToken Lost => _lost.Token;
++
++    private ApprovalNoticeLease(Process process)
++    {
++        _process = process;
++        _ = DrainErrorAsync();
++        _ = ReadProtocolAsync();
++    }
++
++    private async Task DrainErrorAsync()
++    {
++        try
++        {
++            var buffer = new char[1024];
++            while (await _process.StandardError.ReadAsync(buffer.AsMemory()).ConfigureAwait(false) != 0) { }
++        }
++        catch { /* Never retain uncontrolled helper output. */ }
++    }
++
++    private async Task ReadProtocolAsync()
++    {
++        try
++        {
++            string? line;
++            while ((line = await _process.StandardOutput.ReadLineAsync().ConfigureAwait(false)) != null)
++            {
++                if (line == "READY" && !_ready.Task.IsCompleted && !_lost.IsCancellationRequested)
++                    _ready.TrySetResult(true);
++                else if (line == "RELEASED" && Volatile.Read(ref _releaseStarted) != 0)
++                {
++                    _released.TrySetResult(true);
++                    return;
++                }
++                else if (line == "LOST")
++                    MarkLost();
++                else
++                {
++                    MarkLost();
++                    return;
++                }
++            }
++        }
++        catch { }
++        MarkLost();
++    }
++
++    private void MarkLost()
++    {
++        _lost.Cancel();
++        _ready.TrySetException(new IOException("Approval notice unavailable."));
++    }
++
++    internal static Task<ApprovalNoticeLease> AcquireAsync(CancellationToken token)
++    {
++        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
++        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
++        return AcquireAsync(Path.Combine(profile, "nodejs", "node.exe"),
++            Path.Combine(local, "Agrippa", "ControlIndicator", "approval-v3", "approval-notice.mjs"), token);
++    }
++
++    internal static async Task<ApprovalNoticeLease> AcquireAsync(string executable, string helper, CancellationToken token)
++    {
++        token.ThrowIfCancellationRequested();
++        var start = new ProcessStartInfo(executable)
++        {
++            UseShellExecute = false, CreateNoWindow = true,
++            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
++        };
++        start.ArgumentList.Add(helper); // Paths with spaces remain a single argument.
++        var lease = new ApprovalNoticeLease(Process.Start(start) ?? throw new IOException("Approval notice did not start."));
++        try
++        {
++            using var wait = CancellationTokenSource.CreateLinkedTokenSource(token, lease.Lost);
++            wait.CancelAfter(TimeSpan.FromSeconds(12));
++            await lease._ready.Task.WaitAsync(wait.Token).ConfigureAwait(false);
++            wait.Token.ThrowIfCancellationRequested();
++            return lease;
++        }
++        catch
++        {
++            // No card constructed, so RELEASE is safe even during countdown.
++            try { await lease.ReleaseAsync().ConfigureAwait(false); }
++            catch { lease.Abandon(); }
++            throw;
++        }
++    }
++
++    // Caller must prove no window exists or its actual Closed event fired.
++    public async Task ReleaseAsync()
++    {
++        if (Interlocked.Exchange(ref _releaseStarted, 1) != 0)
++            throw new InvalidOperationException("Approval notice already releasing.");
++        using var wait = new CancellationTokenSource(TimeSpan.FromSeconds(8));
++        try
++        {
++            await _process.StandardInput.WriteLineAsync("RELEASE".AsMemory(), wait.Token).ConfigureAwait(false);
++            await _process.StandardInput.FlushAsync(wait.Token).ConfigureAwait(false);
++            await _released.Task.WaitAsync(wait.Token).ConfigureAwait(false);
++            await _process.WaitForExitAsync(wait.Token).ConfigureAwait(false);
++        }
++        finally { Abandon(); }
++    }
++
++    // Does NOT send RELEASE or delete any locks. EOF keeps uncertain state on the
++    // helper side when actual window closure could not be established.
++    public void Abandon()
++    {
++        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
++        try { _process.StandardInput.Dispose(); } catch { }
++        _process.Dispose();
++    }
++}
+diff --git a/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs b/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs
+index caf87bd2..61465a9f 100644
+--- a/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs
++++ b/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs
+@@ -9,9 +9,7 @@ using System.Threading.Tasks;
+ namespace OpenClawTray.Services;
+ 
+ /// <summary>
+-/// WinUI adapter for the exec approval prompt: supplies the real dispatcher hop and
+-/// dialog window to <see cref="ExecApprovalV2UiPromptHandler"/>, which owns all
+-/// decision logic (fail-closed semantics, cancellation authority, sanitization).
++/// WinUI adapter; shared approval decision core and existing post-show guard unchanged.
+ /// </summary>
+ public sealed class ExecApprovalV2DialogPromptHandler : IExecApprovalV2PromptHandler
+ {
+@@ -30,21 +28,30 @@ public sealed class ExecApprovalV2DialogPromptHandler : IExecApprovalV2PromptHan
+         ExecApprovalV2PromptRequest request, CancellationToken cancellationToken = default)
+         => _core.PromptAsync(request, cancellationToken);
+ 
+-    // Runs on the UI thread (enqueued by the core). The cancellation registration only
+-    // tears the window down; the outcome is already settled by the core's first-wins TCS.
+     private static async Task<ExecApprovalPromptOutcome> ShowDialogAsync(
+         DispatcherQueue dispatcherQueue, ExecApprovalPromptView view, CancellationToken cancellationToken)
+     {
+-        // Already denied by the core; do not flash a window for a dead request.
+         if (cancellationToken.IsCancellationRequested)
+             return ExecApprovalPromptOutcome.Deny;
++        // Acquisition proves the BLUE notice satisfied its configured painted countdown (1500 ms).
++        var lease = await ApprovalNoticeLease.AcquireAsync(cancellationToken).ConfigureAwait(false);
++        return await ApprovalNoticeFlow.RunAsync(lease,
++            action => dispatcherQueue.TryEnqueue(() => action()),
++            () => new NoticeWindow(new ExecApprovalDialog(view)), cancellationToken).ConfigureAwait(false);
++    }
+ 
+-        var dialog = new ExecApprovalDialog(view);
+-        using var registration = cancellationToken.Register(() =>
+-            dispatcherQueue.TryEnqueue(() =>
+-            {
+-                if (!dialog.IsClosed) dialog.Close();
+-            }));
+-        return await dialog.ShowAsync();
++    private sealed class NoticeWindow : IApprovalNoticeWindow<ExecApprovalPromptOutcome>
++    {
++        private readonly ExecApprovalDialog _dialog;
++        private readonly TaskCompletionSource<bool> _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public Task Closed => _closed.Task;
++        internal NoticeWindow(ExecApprovalDialog dialog)
++        {
++            _dialog = dialog;
++            _dialog.Closed += (_, _) => _closed.TrySetResult(true);
++            if (_dialog.IsClosed) _closed.TrySetResult(true);
++        }
++        public Task<ExecApprovalPromptOutcome> ShowAsync() => _dialog.ShowAsync();
++        public void Close() { if (!_dialog.IsClosed) _dialog.Close(); }
+     }
+ }
+diff --git a/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs b/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs
+index e70d9747..e0fb3c05 100644
+--- a/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs
++++ b/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs
+@@ -222,7 +222,7 @@ public sealed class InstallerIssAssertionTests
+         foreach (var argument in new[]
+         {
+             "-NoProfile",
+-            "-ExecutionPolicy", "Bypass",
++            // Inherit host execution policy; validation must not bypass it.
+             "-File", script,
+             "-NoBuild",
+             "-Configuration", "Release",
+diff --git a/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs
+new file mode 100644
+index 00000000..89b3992a
+--- /dev/null
++++ b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs
+@@ -0,0 +1,40 @@
++using System.IO;
++using Xunit;
++namespace OpenClaw.Tray.Tests.Services;
++public sealed class ApprovalNoticePresentationContractTests
++{
++    private static string Read(string folder, string file) => File.ReadAllText(Path.Combine(
++        TestRepositoryPaths.GetRepositoryRoot(), "src", "OpenClaw.Tray.WinUI", folder, file));
++    [Fact] public void CardCannotActivateForegroundBeforeUserChoosesIt()
++    {
++        var code = Read("Dialogs", "ExecApprovalDialog.cs");
++        Assert.Contains("AppWindow.Show(false)", code);
++        Assert.DoesNotContain("SetForegroundWindow(", code);
++        Assert.DoesNotContain("SetWindowPos(", code);
++        Assert.DoesNotContain("CenterOnScreen()", code);
++        Assert.DoesNotContain("Activate()", code);
++        Assert.Contains("AppWindow.Move(", code);
++    }
++    [Fact] public void DecisionGuardStartsAtShowAndPreservesThreeSeconds()
++    {
++        var code = Read("Dialogs", "ExecApprovalDialog.cs");
++        Assert.Contains("TimeSpan.FromSeconds(3)", code);
++        var show = code.Substring(code.IndexOf("public Task<ExecApprovalPromptOutcome> ShowAsync()"));
++        Assert.True(show.IndexOf("ArmAllowGuard();") < show.IndexOf("AppWindow.Show(false)"));
++        Assert.DoesNotContain("ArmAllowGuard();", code.Substring(0, code.IndexOf("public Task<ExecApprovalPromptOutcome> ShowAsync()")));
++        Assert.Contains("if (IsClosed || !_delayElapsed) return;", code);
++        Assert.Contains("outcome != ExecApprovalPromptOutcome.Deny && !_commandFullySeen", code);
++        Assert.Contains("if (!_delayElapsed || _commandFullySeen || _bodyScroll is null) return;", code);
++    }
++    [Fact] public void PreNoticeAcquiresBeforeCardConstructionAndUsesRealClosedEvent()
++    {
++        var code = Read("Services", "ExecApprovalV2DialogPromptHandler.cs");
++        Assert.True(code.IndexOf("await ApprovalNoticeLease.AcquireAsync") < code.IndexOf("new ExecApprovalDialog(view)"));
++        Assert.Contains("_dialog.Closed +=", code);
++        Assert.Contains("ApprovalNoticeFlow.RunAsync", code);
++        var lease = Read("Services", "ApprovalNoticeLease.cs");
++        Assert.Contains("approval-v3", lease);
++        Assert.DoesNotContain("reservation.lock", lease);
++        Assert.Contains("start.ArgumentList.Add(helper)", lease);
++    }
++}

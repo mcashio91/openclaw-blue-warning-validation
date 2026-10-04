@@ -1,0 +1,65 @@
+name: Validate blue approval notice
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - blue-repair.patch
+      - .github/workflows/validate.yml
+permissions:
+  contents: read
+concurrency:
+  group: blue-repair-validation
+  cancel-in-progress: false
+jobs:
+  windows-validation:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      OPENCLAW_REPO_ROOT: ${{ github.workspace }}\source
+      OPENCLAW_TRAY_DATA_DIR: ${{ runner.temp }}\blue-test-data
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: proposal
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: openclaw/openclaw-windows-node
+          ref: 3c43751b2bace876de3febe478ebabeca172e3ac
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
+        with:
+          dotnet-version: 10.0.400
+      - name: Verify base and repair patch
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -ne '3c43751b2bace876de3febe478ebabeca172e3ac') { throw 'Source identity mismatch' }
+          $digest = (Get-FileHash ../proposal/blue-repair.patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne '6f7f044e3f08116f83b368645fbc546acc88f252192fc444bc935992fbfbc728') { throw 'Repair patch mismatch' }
+          git apply --check ../proposal/blue-repair.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch does not apply' }
+          git apply ../proposal/blue-repair.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Diff check failed' }
+      - name: Required upstream build
+        shell: pwsh
+        working-directory: source
+        run: ./build.ps1 -Project All -Configuration Release -NoTrustRepository
+      - name: Shared tests
+        shell: pwsh
+        working-directory: source
+        run: dotnet test tests/OpenClaw.Shared.Tests -c Release --logger "console;verbosity=normal"
+      - name: Tray tests
+        shell: pwsh
+        working-directory: source
+        run: dotnet test tests/OpenClaw.Tray.Tests -c Release -r win-x64 --logger "console;verbosity=normal"
+# No deployment, secrets, artifact uploads, caches, releases, or policy overrides.
+# Passing here is not proof of the installed PC's visual timing or focus behavior.
