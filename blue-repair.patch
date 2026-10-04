@@ -684,6 +684,368 @@ index caf87bd..cb99195 100644
 +        public void Close() { if (!_dialog.IsClosed) _dialog.Close(); }
      }
  }
+diff --git a/tests/NativeApprovalProof/ApprovalNotice.cs b/tests/NativeApprovalProof/ApprovalNotice.cs
+new file mode 100644
+index 0000000..984c6e2
+--- /dev/null
++++ b/tests/NativeApprovalProof/ApprovalNotice.cs
+@@ -0,0 +1,58 @@
++using System;
++using System.Drawing;
++using System.Diagnostics;
++using System.IO;
++using System.Threading;
++using System.Windows.Forms;
++using System.Runtime.InteropServices;
++class ApprovalNotice : Form {
++ [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
++ [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
++ readonly string nonce;
++ readonly Label label=new Label();
++ readonly Button dismiss=new Button();
++ readonly Stopwatch clock=new Stopwatch();
++ readonly Stopwatch heartbeat=Stopwatch.StartNew();
++ readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();
++ readonly StreamWriter output=new StreamWriter(Console.OpenStandardOutput());
++ readonly IntPtr initialForeground=GetForegroundWindow();
++ readonly string proof=Environment.GetEnvironmentVariable("AGRIPPA_NOTICE_PROOF_DIR");
++ bool savedWarning=false,savedReady=false;
++ long sequence=0,acked=0; bool release=false,invalid=false,painted=false,uncertain=false;
++ readonly object sync=new object();
++ protected override bool ShowWithoutActivation {get{return true;}}
++ protected override CreateParams CreateParams {get{var p=base.CreateParams;p.ExStyle|=0x08000000|0x00000080;return p;}}
++ public ApprovalNotice(string id) {
++  nonce=id;output.AutoFlush=true;Text="Agrippa Windows Approval Notice";TopMost=true;ShowInTaskbar=false;FormBorderStyle=FormBorderStyle.None;
++  var area=Screen.PrimaryScreen.WorkingArea;Width=Math.Min(1000,area.Width-40);Height=160;
++  StartPosition=FormStartPosition.Manual;Location=new Point(area.Left+(area.Width-Width)/2,area.Bottom-Height-20);
++  BackColor=Color.FromArgb(15,80,190);label.ForeColor=Color.White;label.Font=new Font("Segoe UI",24,FontStyle.Bold);label.Dock=DockStyle.Fill;label.TextAlign=ContentAlignment.MiddleCenter;
++  label.Text="WINDOWS APPROVAL CARD IN 1.5 SECONDS";Controls.Add(label);
++  dismiss.Text="I CLOSED THE APPROVAL CARD - DISMISS UNKNOWN NOTICE";
++  dismiss.Dock=DockStyle.Bottom;dismiss.Height=42;dismiss.Visible=false;dismiss.TabStop=false;
++  dismiss.Click+=delegate {if(uncertain&&!release)Close();};
++  Controls.Add(dismiss);
++  FormClosing+=delegate(object sender,FormClosingEventArgs e){
++   if(e.CloseReason==CloseReason.UserClosing&&!release&&!uncertain)e.Cancel=true;
++  };
++  label.Paint+=delegate {if(!painted){painted=true;clock.Start();}};
++  var input=new Thread(ReadCommands);input.IsBackground=true;input.Start();
++  timer.Interval=50;timer.Tick+=delegate{TickUI();};timer.Start();
++ }
++ void ReadCommands(){try{string line;while((line=Console.In.ReadLine())!=null){var p=line.Split(' ');lock(sync){
++  if(p.Length==3&&p[0]=="PING"&&p[1]==nonce){long n;if(!Int64.TryParse(p[2],out n)||n<=sequence){invalid=true;return;}sequence=n;heartbeat.Restart();}
++  else if(p.Length==2&&p[0]=="RELEASE"&&p[1]==nonce){release=true;return;}
++  else{invalid=true;return;}
++ }}lock(sync){invalid=true;}}catch{lock(sync){invalid=true;}}}
++ void TickUI(){lock(sync){
++  if(release){Hide();if(!IsWindowVisible(Handle)){try{output.WriteLine("HIDDEN "+nonce);}catch{}Close();}return;}
++  if(invalid||heartbeat.ElapsedMilliseconds>2000){uncertain=true;BackColor=Color.FromArgb(145,88,0);label.Text="APPROVAL STATUS UNKNOWN\nCLOSE THE APPROVAL CARD BEFORE DISMISSING";dismiss.Visible=true;Invalidate(true);Update();return;}
++  if(uncertain)return;
++  label.Text=clock.ElapsedMilliseconds<1500?"WINDOWS APPROVAL CARD IN "+(Math.Max(0,1500-clock.ElapsedMilliseconds)/1000.0).ToString("0.0",System.Globalization.CultureInfo.InvariantCulture)+" SECONDS\nPLEASE WATCH FOR YOUR APPROVAL CARD":"WINDOWS APPROVAL REQUEST\nPLEASE REVIEW THE HOST APPROVAL CARD";
++  Invalidate(true);Update();label.Update();
++  if(proof!=null&&painted&&Visible){bool ready=clock.ElapsedMilliseconds>=1500;if((ready&&!savedReady)||(!ready&&!savedWarning)){Directory.CreateDirectory(proof);using(var b=new Bitmap(Width,Height)){DrawToBitmap(b,new Rectangle(0,0,Width,Height));b.Save(Path.Combine(proof,ready?"blue-ready.png":"blue-warning.png"));}File.WriteAllText(Path.Combine(proof,"foreground.txt"),(initialForeground==GetForegroundWindow()).ToString());if(ready)savedReady=true;else savedWarning=true;}}
++  if(painted&&Visible&&IsWindowVisible(Handle)&&sequence>acked){acked=sequence;try{output.WriteLine("ACK "+nonce+" "+acked+" "+clock.ElapsedMilliseconds);}catch{invalid=true;}}
++ }}
++ [STAThread] static void Main(string[] args){Guid parsed;if(args.Length!=1||!Guid.TryParse(args[0],out parsed))return;
++  bool owned;using(var mutex=new Mutex(true,"Local\\AgrippaApprovalNoticeV3",out owned)){if(!owned)return;Application.EnableVisualStyles();Application.Run(new ApprovalNotice(args[0]));}}
++}
+diff --git a/tests/NativeApprovalProof/Invoke-IsolatedNativeProof.ps1 b/tests/NativeApprovalProof/Invoke-IsolatedNativeProof.ps1
+new file mode 100644
+index 0000000..587514d
+--- /dev/null
++++ b/tests/NativeApprovalProof/Invoke-IsolatedNativeProof.ps1
+@@ -0,0 +1,103 @@
++#Requires -Version 7.0
++[CmdletBinding()]
++param(
++    [Parameter(Mandatory)][string]$SourceRepository,
++    [Parameter(Mandatory)][string]$RepairPatch,
++    [Parameter(Mandatory)][string]$HelperSource,
++    [Parameter(Mandatory)][string]$Dotnet,
++    [string]$Node,
++    [switch]$AttendedSyntheticProof
++)
++$ErrorActionPreference = 'Stop'
++if (-not $IsWindows) { throw 'This launcher is Windows-only.' }
++$baseCommit = '3c43751b2bace876de3febe478ebabeca172e3ac'
++$repairDigest = 'aeb0a18b9b22209a94d8b934bda928104552a91af6b9316dbe566e0e6e69b9d4'
++$proofDigest = '2d20a60e42f5ed466cfaaafd7ff2e28698e2af1655c12931aaaab548265cc8c1'
++$helperDigests = @{
++    'ApprovalNotice.cs' = 'fa2a21f07d6fc1bcf4d2e236e78105a782e13d9684c7be68dd690af54a20303f'
++    'approval-notice.mjs' = '9c2fb510b6f330f47200fff32fe2c63bacbd8d56ede4dc44fbe623a9b91df6d7'
++    'protocol.mjs' = '0c76fa0dbaee65ee68ed272afcf451bf05172ba28ffe7d6340271a6fc5ea42bc'
++    'receipt.mjs' = '776867b560416b56b98f995e6f0c40a7dbb1784341a762027b2f54a8e2280c2f'
++    'render-proof.mjs' = 'c7a5809fb7ac8a723b0a05a8066a28328e2e75a9833e9dc2bf1e95486c948d8e'
++}
++$proofPatch = Join-Path $PSScriptRoot 'native-proof.patch'
++foreach ($item in @($RepairPatch, $proofPatch, $Dotnet)) {
++    if (-not (Test-Path -LiteralPath $item -PathType Leaf)) { throw "Missing required file: $item" }
++}
++if (-not (Test-Path -LiteralPath (Join-Path $SourceRepository '.git'))) { throw 'A local source git checkout is required; this launcher performs no network clone.' }
++if ((Get-FileHash -LiteralPath $RepairPatch -Algorithm SHA256).Hash.ToLowerInvariant() -ne $repairDigest) { throw 'Repair patch hash mismatch. Use exact LF bytes.' }
++if ((Get-FileHash -LiteralPath $proofPatch -Algorithm SHA256).Hash.ToLowerInvariant() -ne $proofDigest) { throw 'Native proof patch hash mismatch. Use exact LF bytes.' }
++if ($AttendedSyntheticProof -and (-not [Environment]::UserInteractive -or -not (Test-Path -LiteralPath $Node -PathType Leaf))) { throw 'An attended desktop and explicit node.exe path are required for native execution.' }
++foreach ($name in $helperDigests.Keys) {
++    $path = Join-Path $HelperSource $name
++    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $helperDigests[$name]) { throw "Helper source hash mismatch: $name. Use exact LF bytes." }
++}
++$stage = Join-Path ([IO.Path]::GetTempPath()) ('AgrippaNativeProof-' + [Guid]::NewGuid().ToString('N'))
++$source = Join-Path $stage 'source'
++$logs = Join-Path $stage 'logs'
++$evidence = Join-Path $stage 'evidence'
++$helper = Join-Path $stage 'helper'
++$data = Join-Path $stage 'empty-tray-data'
++foreach ($directory in @($stage, $logs, $evidence, $helper, $data)) { [void](New-Item -ItemType Directory -Path $directory) }
++Write-Host "Isolated staging and retained evidence: $stage"
++function Invoke-Checked([string]$File, [string[]]$Arguments, [string]$LogName) {
++    & $File @Arguments 2>&1 | Tee-Object -FilePath (Join-Path $logs $LogName) | Out-Host
++    if ($LASTEXITCODE -ne 0) { throw "$File failed with exit code $LASTEXITCODE; see $LogName" }
++}
++$names = @('PATH','DOTNET_ROOT','OPENCLAW_REPO_ROOT','OPENCLAW_TRAY_DATA_DIR','AGRIPPA_NATIVE_APPROVAL_PROOF','AGRIPPA_PROOF_NODE_EXE','AGRIPPA_PROOF_HELPER_MJS','AGRIPPA_NATIVE_PROOF_DIR','DOTNET_CLI_TELEMETRY_OPTOUT')
++$saved = @{}
++foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
++$locationPushed = $false
++try {
++    $env:DOTNET_ROOT = Split-Path -Parent ([IO.Path]::GetFullPath($Dotnet))
++    $env:PATH = $env:DOTNET_ROOT + [IO.Path]::PathSeparator + $env:PATH
++    $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
++    $env:OPENCLAW_REPO_ROOT = $source
++    $env:OPENCLAW_TRAY_DATA_DIR = $data
++    $env:AGRIPPA_NATIVE_APPROVAL_PROOF = $null
++    Invoke-Checked $Dotnet @('--list-sdks') 'sdk.log'
++    if (-not (Select-String -LiteralPath (Join-Path $logs 'sdk.log') -Pattern '^10\.0\.400 ' -Quiet)) { throw 'Existing .NET SDK 10.0.400 is required. This launcher does not install it.' }
++    Invoke-Checked 'git' @('clone','--no-hardlinks','--no-checkout','--',$SourceRepository,$source) 'clone.log'
++    Invoke-Checked 'git' @('-C',$source,'checkout','--detach',$baseCommit) 'checkout.log'
++    Invoke-Checked 'git' @('-C',$source,'apply','--check',[IO.Path]::GetFullPath($RepairPatch)) 'repair-check.log'
++    Invoke-Checked 'git' @('-C',$source,'apply',[IO.Path]::GetFullPath($RepairPatch)) 'repair-apply.log'
++    Invoke-Checked 'git' @('-C',$source,'apply','--check',$proofPatch) 'proof-check.log'
++    Invoke-Checked 'git' @('-C',$source,'apply',$proofPatch) 'proof-apply.log'
++    Invoke-Checked 'git' @('-C',$source,'diff','--check') 'diff-check.log'
++    foreach ($file in @('ApprovalNotice.cs','approval-notice.mjs','protocol.mjs','receipt.mjs','render-proof.mjs')) {
++        Copy-Item -LiteralPath (Join-Path $HelperSource $file) -Destination (Join-Path $helper $file)
++    }
++    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
++    Invoke-Checked $csc @('/nologo','/target:winexe','/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll',('/out:' + (Join-Path $helper 'ApprovalNotice.exe')),(Join-Path $helper 'ApprovalNotice.cs')) 'helper-build.log'
++    Push-Location -LiteralPath $source
++    $locationPushed = $true
++    $project = 'tests/OpenClaw.Tray.UITests/OpenClaw.Tray.UITests.csproj'
++    Invoke-Checked $Dotnet @('restore',$project,'-r','win-x64') 'ui-restore.log'
++    Invoke-Checked $Dotnet @('build',$project,'-c','Debug','-r','win-x64','--no-restore') 'ui-build.log'
++    $assembly = Join-Path $source 'tests/OpenClaw.Tray.UITests/bin/Debug/net10.0-windows10.0.22621.0/win-x64/OpenClaw.Tray.UITests.dll'
++    if (-not (Test-Path -LiteralPath $assembly -PathType Leaf)) { throw 'Expected compiled UI test assembly missing.' }
++    $files = @($RepairPatch,$proofPatch,$Dotnet,$assembly) + @(Get-ChildItem -LiteralPath $helper -File | ForEach-Object FullName)
++    @($files | ForEach-Object { Get-FileHash -LiteralPath $_ -Algorithm SHA256 } | Select-Object Path,Hash) | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidence 'input-hashes.json')
++    if (-not $AttendedSyntheticProof) {
++        Write-Host 'COMPILE ONLY finished. No UI, real approval, install, runtime installation, or production settings access was requested.'
++        Write-Host 'This targeted compilation is not the required full build/Shared/Tray validation or native proof.'
++    } else {
++        $env:AGRIPPA_NATIVE_APPROVAL_PROOF = 'I_AM_RUNNING_ISOLATED_PROOF'
++        $env:AGRIPPA_PROOF_NODE_EXE = [IO.Path]::GetFullPath($Node)
++        $env:AGRIPPA_PROOF_HELPER_MJS = Join-Path $helper 'approval-notice.mjs'
++        $env:AGRIPPA_NATIVE_PROOF_DIR = $evidence
++        Write-Host 'Starting synthetic visible proof. Keep this console foreground and do not click any approval. No production node or tray app is started.'
++        Invoke-Checked $Dotnet @('test',$project,'-c','Debug','-r','win-x64','--no-build','--no-restore','--filter','FullyQualifiedName~ApprovalNoticeNativeProofTests','--results-directory',$evidence,'--logger','trx;LogFileName=approval-native.trx') 'native-test.log'
++        [xml]$trx = Get-Content -LiteralPath (Join-Path $evidence 'approval-native.trx') -Raw
++        $manager = [Xml.XmlNamespaceManager]::new($trx.NameTable)
++        $manager.AddNamespace('t','http://microsoft.com/schemas/VisualStudio/TeamTest/2010')
++        $counters = $trx.SelectSingleNode('//t:ResultSummary/t:Counters',$manager)
++        if ($null -eq $counters -or $counters.total -ne '2' -or $counters.executed -ne '2' -or $counters.passed -ne '2') { throw 'Native proof did not execute and pass both scenarios. A skip/no-op is not success.' }
++        Write-Host 'Both synthetic scenarios passed. Screen images still require human inspection; installed behavior remains unproved.'
++    }
++} finally {
++    if ($locationPushed) { Pop-Location }
++    foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
++    @(Get-ChildItem -LiteralPath $evidence -Recurse -File | ForEach-Object { Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256 } | Select-Object Path,Hash) | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'evidence-hashes.json')
++    Write-Host "Retained staging: $stage"
++}
+diff --git a/tests/NativeApprovalProof/approval-notice.mjs b/tests/NativeApprovalProof/approval-notice.mjs
+new file mode 100644
+index 0000000..ca45df5
+--- /dev/null
++++ b/tests/NativeApprovalProof/approval-notice.mjs
+@@ -0,0 +1,42 @@
++import {spawn} from 'node:child_process';
++import {createInterface} from 'node:readline';
++import {randomUUID} from 'node:crypto';
++import {mkdir} from 'node:fs/promises';
++import {fileURLToPath} from 'node:url';
++import path from 'node:path';
++import {performance} from 'node:perf_hooks';
++import {NoticeProtocol} from './protocol.mjs';
++import {persistReceiptThenAcknowledge} from './receipt.mjs';
++const root=path.dirname(fileURLToPath(import.meta.url));
++const nonce=randomUUID(),state=new NoticeProtocol(nonce,performance.now());
++const receiptDir=path.join(root,'receipts');await mkdir(receiptDir,{recursive:true});
++const events=[];let child,interval,releaseDeadline=null,lossDeadline=null,done=false,exited=false;
++const event=(name)=>events.push({name,at:new Date().toISOString()});
++const host=createInterface({input:process.stdin,crlfDelay:Infinity});
++function send(line){if(child&&!child.stdin.destroyed)child.stdin.write(line+'\n');}
++function lost(reason){if(state.lost&&lossDeadline!==null)return;state.lost=true;event(reason);process.stdout.write('LOST\n');lossDeadline=performance.now()+15000;}
++async function finish(ok,reason){if(done)return;done=true;clearInterval(interval);event(reason);host.close();process.stdin.pause();
++ try {await persistReceiptThenAcknowledge({dir:receiptDir,nonce,outcome:ok?'released':'unknown',events,
++  acknowledge:line=>new Promise((resolve,reject)=>process.stdout.write(line+'\n',error=>error?reject(error):resolve()))});}
++ catch {ok=false;lost('receipt_unavailable');}
++ // Never kill an unconfirmed visible notice: its UI independently becomes amber.
++ if(!ok&&child&&!exited)child.unref();process.exit(ok?0:2);
++}
++host.on('line',line=>{if(line!=='RELEASE'){lost('invalid_host_protocol');return;}
++ if(!state.releasing){event('release_requested');send(state.release());releaseDeadline=performance.now()+3000;}});
++host.on('close',()=>{if(!done){lost('host_eof_without_confirmed_closure');}});
++child=spawn(path.join(root,'ApprovalNotice.exe'),[nonce],{windowsHide:true,stdio:['pipe','pipe','pipe']});
++child.on('error',()=>{lost('ui_launch_failed');finish(false,'ui_unavailable');});
++child.stdin.on('error',()=>lost('ui_pipe_failed'));
++createInterface({input:child.stdout,crlfDelay:Infinity}).on('line',line=>{try{
++ const message=state.accept(line,performance.now());if(message==='RELEASED'){event('hidden_confirmed');void finish(true,'confirmed_hidden');}
++ else if(message){event(message.toLowerCase());process.stdout.write(message+'\n');}
++}catch{lost('invalid_ui_protocol');}});
++// Drain stderr, but never copy unbounded native output to the host transcript.
++child.stderr.on('data',()=>{});
++child.on('exit',()=>{exited=true;if(!state.released)lost('ui_exit_without_hidden');});
++interval=setInterval(()=>{const now=performance.now();try{state.health(now);}catch{lost('stale_ui_ack');}
++ if((releaseDeadline!==null&&now>releaseDeadline)||(lossDeadline!==null&&now>lossDeadline)){finish(false,'closure_unconfirmed');return;}
++ if(!state.releasing&&!state.lost)send(state.ping());
++},200);
++event('started');
+diff --git a/tests/NativeApprovalProof/proof.mjs b/tests/NativeApprovalProof/proof.mjs
+new file mode 100644
+index 0000000..a98bae9
+--- /dev/null
++++ b/tests/NativeApprovalProof/proof.mjs
+@@ -0,0 +1,12 @@
++import assert from 'node:assert/strict';
++import {NoticeProtocol} from './protocol.mjs';
++const p=new NoticeProtocol('nonce',0);
++assert.equal(p.ping(),'PING nonce 1');
++assert.equal(p.accept('ACK nonce 1 1499',1499),undefined);
++p.ping();assert.equal(p.accept('ACK nonce 2 1500',1500),'READY');
++p.ping();assert.equal(p.accept('ACK nonce 3 3200',3200),undefined);
++assert.throws(()=>p.health(4701),/expired/);
++assert.equal(p.release(),'RELEASE nonce');assert.equal(p.accept('HIDDEN nonce',4800),'RELEASED');
++const cancel=new NoticeProtocol('c',0);cancel.ping();cancel.release();assert.equal(cancel.accept('ACK c 1 4000',4000),undefined);assert.equal(cancel.accept('HIDDEN c',4100),'RELEASED');
++const malformed=new NoticeProtocol('m',0);assert.throws(()=>malformed.accept('HIDDEN m',1));assert.throws(()=>malformed.accept('ACK wrong 1 1500',1500));assert.throws(()=>malformed.health(8001));
++console.log('PASS: >=1.5s gate, continuous freshness, release after loss, cancel before READY, strict protocol');
+diff --git a/tests/NativeApprovalProof/protocol.mjs b/tests/NativeApprovalProof/protocol.mjs
+new file mode 100644
+index 0000000..13f2f88
+--- /dev/null
++++ b/tests/NativeApprovalProof/protocol.mjs
+@@ -0,0 +1,16 @@
++// Deterministic protocol core. No desktop reservation is read or written.
++export class NoticeProtocol {
++ constructor(nonce, now) { this.nonce=nonce;this.started=now;this.last=null;this.sent=0;this.acked=0;this.ready=false;this.releasing=false;this.released=false;this.lost=false; }
++ ping(){return `PING ${this.nonce} ${++this.sent}`;}
++ accept(line,now){
++  const p=line.split(' ');
++  if(p.length===2&&p[0]==='HIDDEN'&&p[1]===this.nonce&&this.releasing){this.released=true;return 'RELEASED';}
++  if(p.length!==4||p[0]!=='ACK'||p[1]!==this.nonce||!/^\d+$/.test(p[2])||!/^\d+$/.test(p[3]))throw Error('Invalid UI protocol');
++  const seq=Number(p[2]),elapsed=Number(p[3]);
++  if(!Number.isSafeInteger(seq)||(seq>this.sent||seq<=this.acked)||!Number.isSafeInteger(elapsed)||elapsed<0)throw Error('Invalid UI acknowledgement');
++  this.last=now;this.acked=seq;
++  if(!this.ready&&!this.releasing&&!this.lost&&elapsed>=1500&&now-this.started>=1500){this.ready=true;return 'READY';}
++ }
++ release(){this.releasing=true;return `RELEASE ${this.nonce}`;}
++ health(now){if(this.released)return; if((this.last===null&&now-this.started>8000)||(this.last!==null&&now-this.last>1500)){this.lost=true;throw Error('UI acknowledgement expired');}}
++}
+diff --git a/tests/NativeApprovalProof/receipt.mjs b/tests/NativeApprovalProof/receipt.mjs
+new file mode 100644
+index 0000000..aec2de9
+--- /dev/null
++++ b/tests/NativeApprovalProof/receipt.mjs
+@@ -0,0 +1,21 @@
++import {writeFile, rename, readFile} from 'node:fs/promises';
++import path from 'node:path';
++
++// A RELEASED acknowledgement is a commit: its exact receipt bytes must be
++// flushed, atomically published and read back first. Unknown is never released.
++export async function persistReceiptThenAcknowledge({dir, nonce, outcome, events, acknowledge,
++  storage = {writeFile, rename, readFile}}) {
++ if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(nonce))
++  throw new Error('Invalid receipt nonce');
++ if (outcome !== 'released' && outcome !== 'unknown')
++  throw new Error('Invalid receipt outcome');
++ const target = path.join(dir, nonce + '.json');
++ const staging = target + '.staging';
++ const bytes = JSON.stringify({schema:1,nonce,outcome,events}) + '\n';
++ await storage.writeFile(staging, bytes, {flag:'wx', flush:true});
++ await storage.rename(staging, target);
++ const observed = await storage.readFile(target, 'utf8');
++ if (observed !== bytes) throw new Error('Receipt readback mismatch');
++ if (outcome === 'released') await acknowledge('RELEASED');
++ return target;
++}
+diff --git a/tests/NativeApprovalProof/render-proof.mjs b/tests/NativeApprovalProof/render-proof.mjs
+new file mode 100644
+index 0000000..5adb7df
+--- /dev/null
++++ b/tests/NativeApprovalProof/render-proof.mjs
+@@ -0,0 +1,22 @@
++// Windows fixture only; shows blue notice, never opens an approval card or injects input.
++import {spawn} from 'node:child_process';
++import {createInterface} from 'node:readline';
++import {randomUUID} from 'node:crypto';
++import {mkdir,writeFile,readFile} from 'node:fs/promises';
++import {performance} from 'node:perf_hooks';
++import path from 'node:path';
++import {fileURLToPath} from 'node:url';
++import assert from 'node:assert/strict';
++const root=path.dirname(fileURLToPath(import.meta.url)),dir=path.join(root,'proof-'+randomUUID());await mkdir(dir);
++const started=performance.now();const child=spawn(path.join(root,'ApprovalNotice.exe'),[randomUUID()],{windowsHide:true,stdio:['pipe','pipe','pipe'],env:{...process.env,AGRIPPA_NOTICE_PROOF_DIR:dir}});
++const nonce=child.spawnargs[1];let seq=0,readyAt=null,hidden=false;const rows=[];
++const timer=setInterval(()=>child.stdin.write(`PING ${nonce} ${++seq}\n`),200);
++const deadline=setTimeout(()=>{clearInterval(timer);child.stdin.write(`RELEASE ${nonce}\n`);process.exitCode=1;setTimeout(async()=>{await writeFile(path.join(dir,'receipt-timeout.json'),JSON.stringify({outcome:'unknown',rows}));process.exit(2);},3000).unref();},10000);
++child.stderr.resume();child.stdin.on('error',()=>{});
++createInterface({input:child.stdout}).on('line',line=>{rows.push({line,elapsed:performance.now()-started});const p=line.split(' ');
++ if(p[0]==='ACK'&&Number(p[3])>=1500&&readyAt===null){readyAt=performance.now()-started;clearInterval(timer);child.stdin.write(`RELEASE ${nonce}\n`);}
++ if(line===`HIDDEN ${nonce}`)hidden=true;
++});
++await new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',resolve);});clearTimeout(deadline);clearInterval(timer);
++await writeFile(path.join(dir,'receipt.json'),JSON.stringify({readyAt,hidden,rows},null,2));assert(readyAt>=1500);assert(hidden);assert.equal((await readFile(path.join(dir,'foreground.txt'),'utf8')).trim(),'True');
++console.log('PASS rendered >=1.5s, hidden acknowledged, foreground unchanged. Inspect PNGs in '+dir);
+diff --git a/tests/NativeApprovalProof/test-receipt.mjs b/tests/NativeApprovalProof/test-receipt.mjs
+new file mode 100644
+index 0000000..d1e71eb
+--- /dev/null
++++ b/tests/NativeApprovalProof/test-receipt.mjs
+@@ -0,0 +1,40 @@
++import assert from 'node:assert/strict';
++import {mkdir, mkdtemp, readFile, readdir} from 'node:fs/promises';
++import path from 'node:path';
++import {fileURLToPath} from 'node:url';
++import {persistReceiptThenAcknowledge} from './receipt.mjs';
++
++const root=path.dirname(fileURLToPath(import.meta.url));
++const runs=path.join(root,'test-runs');
++await mkdir(runs,{recursive:true});
++const dir=await mkdtemp(path.join(runs,'receipt-'));
++
++let allowWrite;
++const writeGate=new Promise(resolve=>{allowWrite=resolve;});
++const calls=[];
++let mockBytes;
++const pending=persistReceiptThenAcknowledge({dir,nonce:'00000000-0000-0000-0000-000000000001',outcome:'released',events:[],
++ storage:{writeFile:async(_path,bytes)=>{await writeGate;mockBytes=bytes;},rename:async()=>{calls.push('renamed');},readFile:async()=>mockBytes},
++ acknowledge:async()=>{assert.deepEqual(calls,['renamed']);calls.push('acknowledged');}});
++await Promise.resolve();
++assert.deepEqual(calls,[],'acknowledgement preceded receipt write');
++allowWrite();
++await pending;
++assert.deepEqual(calls,['renamed','acknowledged']);
++
++let acknowledged=false;
++await assert.rejects(persistReceiptThenAcknowledge({dir,nonce:'00000000-0000-0000-0000-000000000002',outcome:'released',events:[],
++ storage:{writeFile:async()=>{throw Error('disk unavailable');},rename:async()=>{},readFile:async()=>''},
++ acknowledge:async()=>{acknowledged=true;}}),/disk unavailable/);
++assert.equal(acknowledged,false,'receipt failure acknowledged release');
++await assert.rejects(persistReceiptThenAcknowledge({dir,nonce:'00000000-0000-0000-0000-000000000002',outcome:'released',events:[],
++ storage:{writeFile:async()=>{},rename:async()=>{},readFile:async()=>''},
++ acknowledge:async()=>{acknowledged=true;}}),/readback mismatch/);
++assert.equal(acknowledged,false,'receipt mismatch acknowledged release');
++
++await persistReceiptThenAcknowledge({dir,nonce:'00000000-0000-0000-0000-000000000003',outcome:'unknown',events:[{name:'lost'}],
++ acknowledge:async()=>{throw Error('unknown was acknowledged');}});
++const unknown=JSON.parse(await readFile(path.join(dir,'00000000-0000-0000-0000-000000000003.json'),'utf8'));
++assert.equal(unknown.outcome,'unknown');
++assert.deepEqual((await readdir(dir)).sort(),['00000000-0000-0000-0000-000000000003.json']);
++console.log('PASS: durable acknowledgement order, write failure, unknown receipt');
 diff --git a/tests/OpenClaw.Shared.Tests/ExecApprovalV2PipelineIntegrationTests.cs b/tests/OpenClaw.Shared.Tests/ExecApprovalV2PipelineIntegrationTests.cs
 index d5081e6..2e9ea33 100644
 --- a/tests/OpenClaw.Shared.Tests/ExecApprovalV2PipelineIntegrationTests.cs
@@ -999,6 +1361,19 @@ index e70d974..e0fb3c0 100644
              "-File", script,
              "-NoBuild",
              "-Configuration", "Release",
+diff --git a/tests/OpenClaw.Tray.Tests/OpenClaw.Tray.Tests.csproj b/tests/OpenClaw.Tray.Tests/OpenClaw.Tray.Tests.csproj
+index 63a59eb..6333ebc 100644
+--- a/tests/OpenClaw.Tray.Tests/OpenClaw.Tray.Tests.csproj
++++ b/tests/OpenClaw.Tray.Tests/OpenClaw.Tray.Tests.csproj
+@@ -85,6 +85,8 @@
+   </ItemGroup>
+ 
+   <ItemGroup>
++    <Compile Include="..\..\src\OpenClaw.Tray.WinUI\Services\ApprovalNoticeFlow.cs" Link="Services\ApprovalNoticeFlow.cs" />
++    <Compile Include="..\..\src\OpenClaw.Tray.WinUI\Services\ApprovalNoticeLease.cs" Link="Services\ApprovalNoticeLease.cs" />
+     <Compile Include="..\..\src\OpenClaw.Tray.WinUI\Services\DeepLinkHandler.cs" Link="Services\DeepLinkHandler.cs" />
+     <Compile Include="..\..\src\OpenClaw.Tray.WinUI\Services\DeepLinkSecurityPolicy.cs" Link="Services\DeepLinkSecurityPolicy.cs" />
+     <Compile Include="..\..\src\OpenClaw.Tray.WinUI\Services\ActivationRoute.cs" Link="Services\ActivationRoute.cs" />
 diff --git a/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticeFlowTests.cs b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticeFlowTests.cs
 new file mode 100644
 index 0000000..e260601
@@ -1141,3 +1516,387 @@ index 0000000..62134da
 +        Assert.Contains("start.ArgumentList.Add(helper)", lease);
 +    }
 +}
+diff --git a/tests/OpenClaw.Tray.UITests/ApprovalNoticeNativeProofTests.cs b/tests/OpenClaw.Tray.UITests/ApprovalNoticeNativeProofTests.cs
+new file mode 100644
+index 0000000..d86b9c2
+--- /dev/null
++++ b/tests/OpenClaw.Tray.UITests/ApprovalNoticeNativeProofTests.cs
+@@ -0,0 +1,355 @@
++// Isolated, opt-in proof. No node request, Allow/Deny invocation, or command execution.
++using System.Diagnostics;
++using System.Drawing;
++using System.Drawing.Imaging;
++using System.Runtime.InteropServices;
++using System.Text.Json;
++using System.Windows.Automation;
++using Microsoft.UI.Xaml;
++using Microsoft.UI.Xaml.Controls;
++using Microsoft.UI.Xaml.Media;
++using OpenClaw.Shared.ExecApprovals;
++using OpenClawTray.Dialogs;
++using OpenClawTray.Services;
++using WinRT.Interop;
++
++namespace OpenClaw.Tray.UITests;
++
++public sealed class NativeApprovalProofFactAttribute : FactAttribute
++{
++    public NativeApprovalProofFactAttribute()
++    {
++        if (Environment.GetEnvironmentVariable("AGRIPPA_NATIVE_APPROVAL_PROOF") != "I_AM_RUNNING_ISOLATED_PROOF")
++            Skip = "Attended isolated native approval proof is not enabled.";
++    }
++}
++
++[CollectionDefinition(Name, DisableParallelization = true)]
++public sealed class NativeApprovalProofCollection : ICollectionFixture<UIThreadFixture>
++{
++    public const string Name = "Isolated native approval proof";
++}
++
++[Collection(NativeApprovalProofCollection.Name)]
++public sealed class ApprovalNoticeNativeProofTests
++{
++    private readonly UIThreadFixture _ui;
++    public ApprovalNoticeNativeProofTests(UIThreadFixture ui) => _ui = ui;
++
++    [NativeApprovalProofFact]
++    [Trait("Category", "ManualNativeApprovalProof")]
++    public async Task BlueThenRealCard_PreservesForeground_GuardsDecisions_ClosesOnCancellation()
++    {
++        var context = RequireOptIn("card");
++        var events = new List<object>();
++        var samples = new List<object>();
++        var clock = Stopwatch.StartNew();
++        var baseline = RequireExternalVisibleForeground();
++        var oldReceipts = ReceiptFiles(context.Helper);
++        var previousProof = Environment.GetEnvironmentVariable("AGRIPPA_NOTICE_PROOF_DIR");
++        Environment.SetEnvironmentVariable("AGRIPPA_NOTICE_PROOF_DIR", context.Run);
++        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(40));
++        ApprovalNoticeLease? lease = null;
++        Task<ExecApprovalPromptOutcome>? flow = null;
++        RealWindow? window = null;
++        var created = new TaskCompletionSource<RealWindow>(TaskCreationOptions.RunContinuationsAsynchronously);
++        var success = false;
++        try
++        {
++            var acquisition = ApprovalNoticeLease.AcquireAsync(context.Node, context.Helper, cancellation.Token);
++            try
++            {
++                var blue = await FindBlueAsync();
++                events.Add(new { name = "blue_visible", elapsedMs = clock.Elapsed.TotalMilliseconds });
++                CaptureScreen(blue, Path.Combine(context.Run, "blue-screen-visible.png"));
++                Assert.Equal(baseline, GetForegroundWindow());
++            }
++            finally
++            {
++                // Retain ownership even if a screen assertion fails during acquisition.
++                lease = await acquisition;
++            }
++            events.Add(new { name = "blue_ready", elapsedMs = clock.Elapsed.TotalMilliseconds });
++            Assert.Equal(baseline, GetForegroundWindow());
++            Assert.True(File.Exists(Path.Combine(context.Run, "blue-warning.png")));
++            Assert.True(File.Exists(Path.Combine(context.Run, "blue-ready.png")));
++            var command = string.Join(" ", Enumerable.Repeat("SYNTHETIC-REVIEW-TEXT-NOT-A-COMMAND", 250));
++            var view = new ExecApprovalPromptView(command, "NATIVE PROOF ONLY", null, null, false, true);
++            flow = ApprovalNoticeFlow.RunAsync<ExecApprovalPromptOutcome>(lease,
++                action => _ui.Dispatcher.TryEnqueue(() => action()),
++                () =>
++                {
++                    var result = new RealWindow(new ExecApprovalDialog(view));
++                    created.TrySetResult(result);
++                    return result;
++                }, cancellation.Token);
++            window = await created.Task.WaitAsync(TimeSpan.FromSeconds(8));
++            var shown = await window.Shown.Task.WaitAsync(TimeSpan.FromSeconds(8));
++            var frameTick = await window.VisibleRender.Task.WaitAsync(TimeSpan.FromSeconds(8));
++            var root = AutomationElement.FromHandle(window.Handle);
++            var deny = FindAction(root, "ExecApprovalDenyAction");
++            var once = FindAction(root, "ExecApprovalAllowOnceAction");
++            var always = FindAction(root, "ExecApprovalAllowAlwaysAction");
++            var firstSampleMs = Stopwatch.GetElapsedTime(shown.AfterTick).TotalMilliseconds;
++            Assert.InRange(firstSampleMs, 0, 750); // No vacuous guard pass after a slow UIA lookup.
++            Assert.False(deny.Current.IsEnabled);
++            Assert.False(once.Current.IsEnabled);
++            Assert.False(always.Current.IsEnabled);
++            Assert.Equal(baseline, GetForegroundWindow());
++            CaptureScreen(root, Path.Combine(context.Run, "card-first-observed-screen.png"));
++            events.Add(new { name = "visible_render", shown.BeforeTick, shown.AfterTick, frameTick,
++                firstSampleMs, frequency = Stopwatch.Frequency,
++                note = "Rendering is a pre-presentation callback, not a physical scanout timestamp." });
++
++            // Record the interval containing the first observed enable transition.
++            // Native Show returned while visible; its timestamp is a lower bound
++            // for the later first rendered frame. No 2.95-second shortcut is used.
++            double lastDisabledMs = 0;
++            double firstEnabledMs;
++            var sampleTimer = Stopwatch.StartNew();
++            while (true)
++            {
++                var tick = Stopwatch.GetTimestamp();
++                var elapsedMs = Stopwatch.GetElapsedTime(shown.AfterTick, tick).TotalMilliseconds;
++                var renderElapsedMs = Stopwatch.GetElapsedTime(frameTick, tick).TotalMilliseconds;
++                var enabled = deny.Current.IsEnabled;
++                var onceEnabled = once.Current.IsEnabled;
++                var alwaysEnabled = always.Current.IsEnabled;
++                var foreground = GetForegroundWindow();
++                samples.Add(new { tick, elapsedMs, renderElapsedMs, denyEnabled = enabled,
++                    onceEnabled, alwaysEnabled, foreground = foreground.ToInt64() });
++                Assert.Equal(baseline, foreground);
++                Assert.False(onceEnabled);
++                Assert.False(alwaysEnabled);
++                if (enabled)
++                {
++                    firstEnabledMs = elapsedMs;
++                    Assert.True(elapsedMs >= 3000, $"Deny enabled {elapsedMs:F2} ms after visible Show returned.");
++                    // The test callback runs just after production's callback in
++                    // the same Rendering event; record that small observer skew.
++                    Assert.True(renderElapsedMs >= 2990, $"Deny enabled {renderElapsedMs:F2} ms after observed render.");
++                    break;
++                }
++                lastDisabledMs = elapsedMs;
++                Assert.True(sampleTimer.Elapsed < TimeSpan.FromSeconds(6), "Deny never armed.");
++                await Task.Delay(20);
++            }
++            Assert.True(firstEnabledMs - lastDisabledMs < 250, "Guard transition observation gap exceeded 250 ms.");
++            events.Add(new { name = "deny_enable_transition", lastDisabledMs, firstEnabledMs });
++            CaptureScreen(root, Path.Combine(context.Run, "deny-armed-allow-disabled.png"));
++            await _ui.RunOnUIAsync(() =>
++            {
++                var scroll = TestSupport.FindLogical<ScrollViewer>(window.Dialog.Content).Single();
++                Assert.True(scroll.ScrollableHeight > 0);
++                Assert.True(scroll.ChangeView(null, scroll.ScrollableHeight, null, disableAnimation: true));
++            });
++            await WaitUntilAsync(() => once.Current.IsEnabled && always.Current.IsEnabled, TimeSpan.FromSeconds(3));
++            Assert.Equal(baseline, GetForegroundWindow());
++            CaptureScreen(root, Path.Combine(context.Run, "scroll-end-actions-enabled.png"));
++            events.Add(new { name = "scroll_end_actions_enabled", elapsedMs = clock.Elapsed.TotalMilliseconds });
++            cancellation.Cancel();
++            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => flow);
++            await window.Closed.WaitAsync(TimeSpan.FromSeconds(3));
++            Assert.False(IsWindowVisible(window.Handle));
++            Assert.Equal(baseline, GetForegroundWindow());
++            CopyReleasedReceipt(context, oldReceipts);
++            Assert.Null(FindBlue());
++            events.Add(new { name = "cancel_closed_and_released", elapsedMs = clock.Elapsed.TotalMilliseconds });
++            success = true;
++        }
++        finally
++        {
++            cancellation.Cancel();
++            try
++            {
++                if (flow is not null)
++                {
++                    try { await flow.WaitAsync(TimeSpan.FromSeconds(12)); }
++                    catch (OperationCanceledException) { }
++                }
++                else if (lease is not null)
++                    await lease.ReleaseAsync(); // No card was ever handed to the flow.
++            }
++            finally
++            {
++                Environment.SetEnvironmentVariable("AGRIPPA_NOTICE_PROOF_DIR", previousProof);
++                await File.WriteAllTextAsync(Path.Combine(context.Run, "events.json"),
++                    JsonSerializer.Serialize(new { success, events, samples }, new JsonSerializerOptions { WriteIndented = true }));
++            }
++        }
++    }
++
++    [NativeApprovalProofFact]
++    [Trait("Category", "ManualNativeApprovalProof")]
++    public async Task CancelBlueAcquisitionBeforeReady_ReleasesWithoutCreatingCard()
++    {
++        var context = RequireOptIn("countdown-cancel");
++        var baseline = RequireExternalVisibleForeground();
++        var oldReceipts = ReceiptFiles(context.Helper);
++        var previousProof = Environment.GetEnvironmentVariable("AGRIPPA_NOTICE_PROOF_DIR");
++        Environment.SetEnvironmentVariable("AGRIPPA_NOTICE_PROOF_DIR", context.Run);
++        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
++        var acquisition = ApprovalNoticeLease.AcquireAsync(context.Node, context.Helper, cancellation.Token);
++        var success = false;
++        long cancelTick = 0;
++        try
++        {
++            var blue = await FindBlueAsync();
++            Assert.False(acquisition.IsCompleted, "READY arrived before countdown cancellation could be observed.");
++            var blueHandle = new IntPtr(blue.Current.NativeWindowHandle);
++            cancelTick = Stopwatch.GetTimestamp();
++            cancellation.Cancel(); // No Flow or card exists in this acquisition-only scenario.
++            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => acquisition);
++            Assert.False(IsWindowVisible(blueHandle));
++            Assert.Equal(baseline, GetForegroundWindow());
++            CopyReleasedReceipt(context, oldReceipts);
++            Assert.Null(FindBlue());
++            success = true;
++        }
++        finally
++        {
++            cancellation.Cancel();
++            try
++            {
++                try { var acquired = await acquisition; await acquired.ReleaseAsync(); }
++                catch (OperationCanceledException) { }
++            }
++            finally
++            {
++                Environment.SetEnvironmentVariable("AGRIPPA_NOTICE_PROOF_DIR", previousProof);
++                await File.WriteAllTextAsync(Path.Combine(context.Run, "result.json"),
++                    JsonSerializer.Serialize(new { success, cancelTick, scenario = "acquisition-only; no card constructed" }));
++            }
++        }
++    }
++
++    private sealed record ProofContext(string Node, string Helper, string Run);
++    private static ProofContext RequireOptIn(string scenario)
++    {
++        Assert.Equal("I_AM_RUNNING_ISOLATED_PROOF", Environment.GetEnvironmentVariable("AGRIPPA_NATIVE_APPROVAL_PROOF"));
++        Assert.True(Environment.UserInteractive, "An attended interactive Windows session is required.");
++        var node = Environment.GetEnvironmentVariable("AGRIPPA_PROOF_NODE_EXE") ?? "";
++        var helper = Environment.GetEnvironmentVariable("AGRIPPA_PROOF_HELPER_MJS") ?? "";
++        var root = Environment.GetEnvironmentVariable("AGRIPPA_NATIVE_PROOF_DIR") ?? "";
++        var data = Environment.GetEnvironmentVariable("OPENCLAW_TRAY_DATA_DIR") ?? "";
++        Assert.True(File.Exists(node) && File.Exists(helper) && Directory.Exists(root) && Directory.Exists(data));
++        Assert.True(File.Exists(Path.Combine(Path.GetDirectoryName(helper)!, "ApprovalNotice.exe")));
++        var production = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Agrippa");
++        Assert.False(Path.GetFullPath(helper).StartsWith(production + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
++        var noticeExists = Mutex.TryOpenExisting(@"Local\AgrippaApprovalNoticeV3", out var noticeMutex);
++        noticeMutex?.Dispose();
++        Assert.False(noticeExists, "Another notice owns this interactive session.");
++        Assert.Null(FindBlue());
++        var run = Path.Combine(root, scenario + "-" + Guid.NewGuid().ToString("N"));
++        Directory.CreateDirectory(run);
++        return new(node, helper, run);
++    }
++
++    private static IntPtr RequireExternalVisibleForeground()
++    {
++        var foreground = GetForegroundWindow();
++        Assert.NotEqual(IntPtr.Zero, foreground);
++        Assert.True(IsWindowVisible(foreground));
++        GetWindowThreadProcessId(foreground, out var processId);
++        Assert.NotEqual((uint)Environment.ProcessId, processId);
++        return foreground;
++    }
++
++    private static HashSet<string> ReceiptFiles(string helper)
++    {
++        var dir = Path.Combine(Path.GetDirectoryName(helper)!, "receipts");
++        return Directory.Exists(dir) ? Directory.GetFiles(dir, "*.json").ToHashSet(StringComparer.OrdinalIgnoreCase) : new(StringComparer.OrdinalIgnoreCase);
++    }
++
++    private static void CopyReleasedReceipt(ProofContext context, HashSet<string> old)
++    {
++        var path = Assert.Single(ReceiptFiles(context.Helper).Except(old));
++        using var receipt = JsonDocument.Parse(File.ReadAllBytes(path));
++        Assert.Equal(1, receipt.RootElement.GetProperty("schema").GetInt32());
++        Assert.Equal("released", receipt.RootElement.GetProperty("outcome").GetString());
++        Assert.Equal(Path.GetFileNameWithoutExtension(path), receipt.RootElement.GetProperty("nonce").GetString());
++        Assert.Contains(receipt.RootElement.GetProperty("events").EnumerateArray(),
++            entry => entry.GetProperty("name").GetString() == "hidden_confirmed");
++        File.Copy(path, Path.Combine(context.Run, "released-receipt.json"), overwrite: false);
++    }
++
++    private static AutomationElement? FindBlue() => AutomationElement.RootElement.FindFirst(TreeScope.Children,
++        new PropertyCondition(AutomationElement.NameProperty, "Agrippa Windows Approval Notice"));
++
++    private static async Task<AutomationElement> FindBlueAsync()
++    {
++        AutomationElement? blue = null;
++        await WaitUntilAsync(() => { blue = FindBlue(); return blue is not null && IsWindowVisible(new IntPtr(blue.Current.NativeWindowHandle)); }, TimeSpan.FromSeconds(5));
++        return blue!;
++    }
++
++    private static AutomationElement FindAction(AutomationElement root, string id) =>
++        root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.AutomationIdProperty, id))
++        ?? throw new InvalidOperationException($"Native action {id} is missing.");
++
++    private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
++    {
++        var clock = Stopwatch.StartNew();
++        while (clock.Elapsed < timeout)
++        {
++            try { if (predicate()) return; }
++            catch (ElementNotAvailableException) { }
++            await Task.Delay(20);
++        }
++        throw new TimeoutException("Native proof observation timed out.");
++    }
++
++    private static void CaptureScreen(AutomationElement element, string path)
++    {
++        var bounds = element.Current.BoundingRectangle;
++        var width = (int)Math.Ceiling(bounds.Width);
++        var height = (int)Math.Ceiling(bounds.Height);
++        Assert.True(width >= 300 && height >= 80, "Visible native window bounds are missing.");
++        using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
++        using (var graphics = Graphics.FromImage(bitmap))
++            graphics.CopyFromScreen((int)Math.Floor(bounds.Left), (int)Math.Floor(bounds.Top), 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
++        var colors = new HashSet<int>();
++        for (var y = 0; y < height; y += Math.Max(1, height / 32))
++            for (var x = 0; x < width; x += Math.Max(1, width / 32)) colors.Add(bitmap.GetPixel(x, y).ToArgb());
++        Assert.True(colors.Count >= 3, "Screen capture is blank or near-uniform.");
++        bitmap.Save(path, ImageFormat.Png);
++        Assert.True(new FileInfo(path).Length > 1000);
++    }
++
++    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
++    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
++    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindowVisible(IntPtr hwnd);
++
++    private sealed class RealWindow : IApprovalNoticeWindow<ExecApprovalPromptOutcome>
++    {
++        public ExecApprovalDialog Dialog { get; }
++        public IntPtr Handle { get; }
++        private readonly TaskCompletionSource<bool> _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public Task Closed => _closed.Task;
++        public TaskCompletionSource<(long BeforeTick, long AfterTick)> Shown { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public TaskCompletionSource<long> VisibleRender { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public RealWindow(ExecApprovalDialog dialog)
++        {
++            Dialog = dialog;
++            Handle = WindowNative.GetWindowHandle(dialog);
++            ((FrameworkElement)dialog.Content).Loaded += (_, _) => CompositionTarget.Rendering += OnRendering;
++            dialog.Closed += (_, _) => { CompositionTarget.Rendering -= OnRendering; _closed.TrySetResult(true); };
++        }
++        private void OnRendering(object? sender, object args)
++        {
++            var content = (FrameworkElement)Dialog.Content;
++            if (!Shown.Task.IsCompleted || Dialog.IsClosed || !content.IsLoaded || content.ActualWidth <= 0 || !IsWindowVisible(Handle)) return;
++            CompositionTarget.Rendering -= OnRendering;
++            VisibleRender.TrySetResult(Stopwatch.GetTimestamp());
++        }
++        public Task<ExecApprovalPromptOutcome> ShowAsync()
++        {
++            var before = Stopwatch.GetTimestamp();
++            var result = Dialog.ShowAsync();
++            Assert.True(IsWindowVisible(Handle));
++            Shown.TrySetResult((before, Stopwatch.GetTimestamp()));
++            return result;
++        }
++        public void Close() { if (!Dialog.IsClosed) Dialog.Close(); }
++    }
++}
+diff --git a/tests/OpenClaw.Tray.UITests/UIThreadFixture.cs b/tests/OpenClaw.Tray.UITests/UIThreadFixture.cs
+index a3f45e1..6399e2b 100644
+--- a/tests/OpenClaw.Tray.UITests/UIThreadFixture.cs
++++ b/tests/OpenClaw.Tray.UITests/UIThreadFixture.cs
+@@ -241,7 +241,17 @@ public sealed class UIThreadFixture : IDisposable
+                     }
+ 
+                     _startupPhase = "activating test window";
+-                    TestWindow.Activate();
++                    if (Environment.GetEnvironmentVariable("AGRIPPA_NATIVE_APPROVAL_PROOF") == "I_AM_RUNNING_ISOLATED_PROOF")
++                    {
++                        // Native proof must preserve the owner's real foreground
++                        // application, not use an activated off-screen test window.
++                        MoveOffScreen(TestWindow);
++                        TestWindow.AppWindow.Show(false);
++                    }
++                    else
++                    {
++                        TestWindow.Activate();
++                    }
+ 
+                     if (!IsSlow)
+                     {
