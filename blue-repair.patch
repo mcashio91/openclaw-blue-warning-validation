@@ -1,5 +1,188 @@
+diff --git a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalPromptOutcome.cs b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalPromptOutcome.cs
+index 92e00a8..97c971b 100644
+--- a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalPromptOutcome.cs
++++ b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalPromptOutcome.cs
+@@ -2,7 +2,8 @@ namespace OpenClaw.Shared.ExecApprovals;
+ 
+ /// <summary>
+ /// Decision returned by <see cref="IExecApprovalV2PromptHandler"/>.
+-/// Deny is the zero/default value so uninitialized instances fail-closed.
++/// Deny is an explicit operator action. Nonhuman prompt failures and commands
++/// that cannot be reviewed are distinct fail-closed outcomes.
+ /// </summary>
+ public enum ExecApprovalPromptOutcome
+ {
+@@ -10,4 +11,6 @@ public enum ExecApprovalPromptOutcome
+     Allow,
+     AllowOnce,
+     AllowAlways,
++    Unavailable,
++    Unreviewable,
+ }
+diff --git a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2NullPromptHandler.cs b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2NullPromptHandler.cs
+index 9957bf1..de25825 100644
+--- a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2NullPromptHandler.cs
++++ b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2NullPromptHandler.cs
+@@ -3,11 +3,11 @@ using System.Threading.Tasks;
+ 
+ namespace OpenClaw.Shared.ExecApprovals;
+ 
+-/// <summary>Default prompt handler stub: always denies. Never throws.</summary>
++/// <summary>Default prompt handler stub: no UI is available. Never throws.</summary>
+ public sealed class ExecApprovalV2NullPromptHandler : IExecApprovalV2PromptHandler
+ {
+     public static readonly ExecApprovalV2NullPromptHandler Instance = new();
+ 
+     public Task<ExecApprovalPromptOutcome> PromptAsync(ExecApprovalV2PromptRequest request, CancellationToken cancellationToken = default)
+-        => Task.FromResult(ExecApprovalPromptOutcome.Deny);
++        => Task.FromResult(ExecApprovalPromptOutcome.Unavailable);
+ }
+diff --git a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2UiPromptHandler.cs b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2UiPromptHandler.cs
+index 5161cf8..fcfe3b2 100644
+--- a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2UiPromptHandler.cs
++++ b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalV2UiPromptHandler.cs
+@@ -20,7 +20,7 @@ public sealed record ExecApprovalPromptView(
+ /// Prompt-handler core behind the approval dialog. UI-free: the dispatcher hop and the
+ /// window are injected as delegates so the full decision behavior is testable without
+ /// WinUI. Fail-closed contract: never throws, never returns plain Allow, and resolves
+-/// Deny on cancellation, enqueue failure, window close, or any internal error.
++/// Unavailable on nonhuman failures. Only a closed window can report a human Deny.
+ /// </summary>
+ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+ {
+@@ -44,7 +44,7 @@ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+         try
+         {
+             if (cancellationToken.IsCancellationRequested)
+-                return ExecApprovalPromptOutcome.Deny;
++                return ExecApprovalPromptOutcome.Unavailable;
+ 
+             // Every field shown in the dialog originates from agent-controlled input,
+             // including the agent label, so all of them go through the display sanitizer
+@@ -55,12 +55,12 @@ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+             if (commandStatus.Truncated || commandStatus.Oversized)
+             {
+                 _logger.Warn("[EXEC-APPROVALS] prompt: command exceeds display limit; denying (cannot review in full)");
+-                return ExecApprovalPromptOutcome.Deny;
++                return ExecApprovalPromptOutcome.Unreviewable;
+             }
+             if (commandStatus.UnsafeConcealment)
+             {
+                 _logger.Warn("[EXEC-APPROVALS] prompt: redaction would hide command syntax; denying (cannot review in full)");
+-                return ExecApprovalPromptOutcome.Deny;
++                return ExecApprovalPromptOutcome.Unreviewable;
+             }
+             var commandText = commandStatus.Text;
+             var agentLabel = ExecApprovalCommandDisplaySanitizer.Sanitize(request.AgentId);
+@@ -86,7 +86,7 @@ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+             // slow dialog can never delay the deny. Window teardown on cancel is
+             // visual cleanup only, owned by the dialog delegate.
+             using var registration = cancellationToken.Register(
+-                () => tcs.TrySetResult(ExecApprovalPromptOutcome.Deny));
++                () => tcs.TrySetResult(ExecApprovalPromptOutcome.Unavailable));
+ 
+             // Cancellation may have resolved the TCS already (inline during Register).
+             // A request that is already denied must never surface a window.
+@@ -96,7 +96,7 @@ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+             if (!_tryEnqueue(() => _ = RunDialogAsync(view, tcs, cancellationToken)))
+             {
+                 _logger.Warn("[EXEC-APPROVALS] prompt: dispatcher enqueue failed; denying");
+-                tcs.TrySetResult(ExecApprovalPromptOutcome.Deny);
++                tcs.TrySetResult(ExecApprovalPromptOutcome.Unavailable);
+             }
+ 
+             var outcome = await tcs.Task.ConfigureAwait(false);
+@@ -104,14 +104,14 @@ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+             {
+                 _logger.Error("[EXEC-APPROVALS] prompt: dialog returned plain Allow; " +
+                     "only AllowOnce/AllowAlways are valid from UI — denying");
+-                return ExecApprovalPromptOutcome.Deny;
++                return ExecApprovalPromptOutcome.Unavailable;
+             }
+             return outcome;
+         }
+         catch (Exception ex)
+         {
+             try { _logger.Warn($"[EXEC-APPROVALS] prompt failed; denying: {ex.Message}"); } catch { }
+-            return ExecApprovalPromptOutcome.Deny;
++            return ExecApprovalPromptOutcome.Unavailable;
+         }
+     }
+ 
+@@ -129,7 +129,7 @@ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+             // dispatcher queue; it is already denied, so never show the dialog.
+             if (cancellationToken.IsCancellationRequested)
+             {
+-                tcs.TrySetResult(ExecApprovalPromptOutcome.Deny);
++                tcs.TrySetResult(ExecApprovalPromptOutcome.Unavailable);
+                 return;
+             }
+ 
+@@ -139,7 +139,7 @@ public sealed class ExecApprovalV2UiPromptHandler : IExecApprovalV2PromptHandler
+         catch (Exception ex)
+         {
+             try { _logger.Warn($"[EXEC-APPROVALS] prompt dialog failed; denying: {ex.Message}"); } catch { }
+-            tcs.TrySetResult(ExecApprovalPromptOutcome.Deny);
++            tcs.TrySetResult(ExecApprovalPromptOutcome.Unavailable);
+         }
+     }
+ }
+diff --git a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs
+index 83d864d..0955bc3 100644
+--- a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs
++++ b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs
+@@ -172,24 +172,43 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
+             {
+                 promptAttempted = true;
+                 ExecApprovalPromptOutcome promptResult;
++                // Bound the dialog lifetime. Timeout is an unavailable presentation,
++                // never evidence that the human clicked Deny.
++                using var promptCts = new CancellationTokenSource(_promptTimeout);
+                 try
+                 {
+-                    // Bound the dialog's lifetime: on timeout the token cancels, the prompt
+-                    // handler tears the window down and resolves Deny, so an unanswered prompt
+-                    // never hangs the request forever.
+-                    using var promptCts = new CancellationTokenSource(_promptTimeout);
+                     promptResult = await _prompt.PromptAsync(
+                         BuildPromptRequest(context, identity, correlationId),
+                         promptCts.Token).ConfigureAwait(false);
+                 }
+                 catch
+                 {
+-                    // Presenter failure → fail-closed, no fallback delegation
+-                    return LogAndReturn(ExecApprovalV2Result.UserDenied("prompt-failed"),
++                    // Presenter failure → fail-closed, no fallback delegation or human-denial claim.
++                    return LogAndReturn(ExecApprovalV2Result.Unavailable(promptCts.IsCancellationRequested
++                        ? "prompt-timed-out" : "prompt-failed"),
+                         correlationId, promptAttempted: true, fallbackUsed: false,
+                         canonical: context.DisplayCommand);
+                 }
+ 
++                // A completion racing the deadline cannot approve after timeout,
++                // regardless of which continuation resumed first.
++                if (promptCts.IsCancellationRequested)
++                    return LogAndReturn(ExecApprovalV2Result.Unavailable("prompt-timed-out"),
++                        correlationId, promptAttempted: true, fallbackUsed: false,
++                        canonical: context.DisplayCommand);
++
++                // Nonhuman outcomes must remain distinct from an explicit Deny. None
++                // may be delegated to askFallback or retried automatically.
++                if (promptResult is ExecApprovalPromptOutcome.Unavailable or ExecApprovalPromptOutcome.Unreviewable)
++                {
++                    var failure = promptResult == ExecApprovalPromptOutcome.Unreviewable
++                        ? ExecApprovalV2Result.ValidationFailed("command-unreviewable")
++                        : ExecApprovalV2Result.Unavailable(promptCts.IsCancellationRequested
++                            ? "prompt-timed-out" : "prompt-unavailable");
++                    return LogAndReturn(failure, correlationId, promptAttempted: true,
++                        fallbackUsed: false, canonical: context.DisplayCommand);
++                }
++
+                 // Allow (plain) from a prompt handler is an invariant violation —
+                 // only AllowOnce and AllowAlways are semantically valid from UI.
+                 if (promptResult == ExecApprovalPromptOutcome.Allow)
 diff --git a/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs b/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
-index 046e67f1..3c14feaf 100644
+index 046e67f..3bcbb11 100644
 --- a/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
 +++ b/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
 @@ -6,7 +6,6 @@ using OpenClawTray.Controls;
@@ -37,7 +220,16 @@ index 046e67f1..3c14feaf 100644
  
      private readonly TaskCompletionSource<ExecApprovalPromptOutcome> _tcs =
          new(TaskCreationOptions.RunContinuationsAsynchronously);
-@@ -63,7 +51,13 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -50,6 +38,8 @@ public sealed class ExecApprovalDialog : WindowEx
+     private ScrollViewer? _bodyScroll;
+     private bool _delayElapsed;
+     private bool _commandFullySeen;
++    private bool _showRequested;
++    private bool _firstRenderObserved;
+     private readonly bool _allowAlwaysAvailable;
+ 
+     public bool IsClosed { get; private set; }
+@@ -63,7 +53,13 @@ public sealed class ExecApprovalDialog : WindowEx
          var windowTitle = $"{AppIdentity.DisplayName} - {LocalizationHelper.GetString("ExecApproval_WindowTitle")}";
          Title = windowTitle;
          this.SetWindowSize(520, 400);
@@ -52,7 +244,45 @@ index 046e67f1..3c14feaf 100644
          this.SetIcon("Assets\\openclaw.ico");
          SystemBackdrop = new MicaBackdrop();
          ExtendsContentIntoTitleBar = true;
-@@ -227,52 +221,42 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -178,13 +174,13 @@ public sealed class ExecApprovalDialog : WindowEx
+         buttonGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+         buttonGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+ 
+-        _denyButton = new Button { Content = LocalizationHelper.GetString("ExecApproval_Deny") };
++        _denyButton = new Button { Content = LocalizationHelper.GetString("ExecApproval_Deny"), IsEnabled = false };
+         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(_denyButton, "ExecApprovalDenyAction");
+         _denyButton.Click += (_, _) => Decide(ExecApprovalPromptOutcome.Deny);
+         Grid.SetColumn(_denyButton, 0);
+         buttonGrid.Children.Add(_denyButton);
+ 
+-        _allowAlwaysButton = new Button { Content = LocalizationHelper.GetString("ExecApproval_AllowAlways") };
++        _allowAlwaysButton = new Button { Content = LocalizationHelper.GetString("ExecApproval_AllowAlways"), IsEnabled = false };
+         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(_allowAlwaysButton, "ExecApprovalAllowAlwaysAction");
+         _allowAlwaysButton.Click += (_, _) => Decide(ExecApprovalPromptOutcome.AllowAlways);
+         Grid.SetColumn(_allowAlwaysButton, 2);
+@@ -199,6 +195,7 @@ public sealed class ExecApprovalDialog : WindowEx
+         {
+             Content = LocalizationHelper.GetString("ExecApproval_AllowOnce"),
+             Style = (Style)Application.Current.Resources["AccentButtonStyle"],
++            IsEnabled = false,
+         };
+         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(_allowOnceButton, "ExecApprovalAllowOnceAction");
+         _allowOnceButton.Click += (_, _) => Decide(ExecApprovalPromptOutcome.AllowOnce);
+@@ -211,6 +208,13 @@ public sealed class ExecApprovalDialog : WindowEx
+         Grid.SetRow(root, 1);
+         outerGrid.Children.Add(root);
+         Content = outerGrid;
++        // Loaded can precede display. The first Rendering callback after Show(false)
++        // starts the decision clock; construction and Show() time cannot arm it.
++        outerGrid.Loaded += (_, _) =>
++        {
++            if (!IsClosed)
++                CompositionTarget.Rendering += OnFirstRendering;
++        };
+ 
+         // Escape denies from anywhere in the window.
+         var escAccel = new Microsoft.UI.Xaml.Input.KeyboardAccelerator
+@@ -227,52 +231,47 @@ public sealed class ExecApprovalDialog : WindowEx
              Microsoft.UI.Xaml.Input.KeyboardAcceleratorPlacementMode.Hidden;
  
          Closed += OnWindowClosed;
@@ -82,11 +312,19 @@ index 046e67f1..3c14feaf 100644
 -
 -        // Initial focus lands on Deny so Enter can never approve.
 -        _denyButton.Focus(FocusState.Programmatic);
-+        ArmAllowGuard();
 +        AppWindow.Show(false);
++        _showRequested = true;
          return _tcs.Task;
      }
  
++    private void OnFirstRendering(object? sender, object e)
++    {
++        if (!_showRequested || _firstRenderObserved || IsClosed) return;
++        _firstRenderObserved = true;
++        CompositionTarget.Rendering -= OnFirstRendering;
++        ArmAllowGuard();
++    }
++
      private void Decide(ExecApprovalPromptOutcome outcome)
      {
 -        if (IsClosed) return;
@@ -101,9 +339,8 @@ index 046e67f1..3c14feaf 100644
 +    // elapsed AND the whole command has been seen. Deny shares the opening delay.
      private void ArmAllowGuard()
      {
-+        _denyButton.IsEnabled = false;
-         _allowOnceButton.IsEnabled = false;
-         _allowAlwaysButton.IsEnabled = false;
+-        _allowOnceButton.IsEnabled = false;
+-        _allowAlwaysButton.IsEnabled = false;
          MaybeArmAllow();
 -        _armTimer = new DispatcherTimer { Interval = AllowArmDelay };
 +        _armTimer = new DispatcherTimer { Interval = DecisionArmDelay };
@@ -116,7 +353,7 @@ index 046e67f1..3c14feaf 100644
              MaybeArmAllow();
          };
          _armTimer.Start();
-@@ -282,7 +266,9 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -282,7 +281,9 @@ public sealed class ExecApprovalDialog : WindowEx
      // before it counts as seen. Once seen it stays seen (scrolling back up is fine).
      private void UpdateCommandSeen()
      {
@@ -127,9 +364,17 @@ index 046e67f1..3c14feaf 100644
          // Ignore pre-layout passes: until the ScrollViewer has actually measured its content
          // (non-zero viewport AND extent), a zero ScrollableHeight means "not laid out yet", not
          // "everything fits". Latching on that would arm the allow buttons for a long command the
+@@ -350,6 +351,7 @@ public sealed class ExecApprovalDialog : WindowEx
+     {
+         IsClosed = true;
+         _armTimer?.Stop();
++        CompositionTarget.Rendering -= OnFirstRendering;
+         Closed -= OnWindowClosed;
+         _tcs.TrySetResult(_outcome);
+     }
 diff --git a/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs
 new file mode 100644
-index 00000000..b48cebe9
+index 0000000..b48cebe
 --- /dev/null
 +++ b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs
 @@ -0,0 +1,104 @@
@@ -239,10 +484,10 @@ index 00000000..b48cebe9
 +}
 diff --git a/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeLease.cs b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeLease.cs
 new file mode 100644
-index 00000000..20871ffe
+index 0000000..b35d6ac
 --- /dev/null
 +++ b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeLease.cs
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,139 @@
 +using System;
 +using System.Diagnostics;
 +using System.IO;
@@ -311,7 +556,7 @@ index 00000000..20871ffe
 +            }
 +        }
 +        catch { }
-+        MarkLost();
++        if (!_released.Task.IsCompletedSuccessfully) MarkLost();
 +    }
 +
 +    private void MarkLost()
@@ -367,6 +612,8 @@ index 00000000..20871ffe
 +            await _process.StandardInput.FlushAsync(wait.Token).ConfigureAwait(false);
 +            await _released.Task.WaitAsync(wait.Token).ConfigureAwait(false);
 +            await _process.WaitForExitAsync(wait.Token).ConfigureAwait(false);
++            if (_process.ExitCode != 0)
++                throw new IOException($"Approval notice exited with status {_process.ExitCode}.");
 +        }
 +        finally { Abandon(); }
 +    }
@@ -381,7 +628,7 @@ index 00000000..20871ffe
 +    }
 +}
 diff --git a/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs b/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs
-index caf87bd2..61465a9f 100644
+index caf87bd..cb99195 100644
 --- a/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs
 +++ b/src/OpenClaw.Tray.WinUI/Services/ExecApprovalV2DialogPromptHandler.cs
 @@ -9,9 +9,7 @@ using System.Threading.Tasks;
@@ -406,7 +653,8 @@ index caf87bd2..61465a9f 100644
      {
 -        // Already denied by the core; do not flash a window for a dead request.
          if (cancellationToken.IsCancellationRequested)
-             return ExecApprovalPromptOutcome.Deny;
+-            return ExecApprovalPromptOutcome.Deny;
++            return ExecApprovalPromptOutcome.Unavailable;
 +        // Acquisition proves the BLUE notice satisfied its configured painted countdown (1500 ms).
 +        var lease = await ApprovalNoticeLease.AcquireAsync(cancellationToken).ConfigureAwait(false);
 +        return await ApprovalNoticeFlow.RunAsync(lease,
@@ -436,8 +684,310 @@ index caf87bd2..61465a9f 100644
 +        public void Close() { if (!_dialog.IsClosed) _dialog.Close(); }
      }
  }
+diff --git a/tests/OpenClaw.Shared.Tests/ExecApprovalV2PipelineIntegrationTests.cs b/tests/OpenClaw.Shared.Tests/ExecApprovalV2PipelineIntegrationTests.cs
+index d5081e6..2e9ea33 100644
+--- a/tests/OpenClaw.Shared.Tests/ExecApprovalV2PipelineIntegrationTests.cs
++++ b/tests/OpenClaw.Shared.Tests/ExecApprovalV2PipelineIntegrationTests.cs
+@@ -137,7 +137,7 @@ public class ExecApprovalV2PipelineIntegrationTests : IDisposable
+         var result = await MakeCoordinator(dialog: _ => ExecApprovalPromptOutcome.Allow)
+             .HandleAsync(Req("""{"command":["where","hello"]}"""), "p5");
+ 
+-        Assert.Equal(ExecApprovalV2Code.UserDenied, result.Code);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, result.Code);
+     }
+ 
+     // ── Attack battery: the three hard-deny paths must cut BEFORE the prompt and
+diff --git a/tests/OpenClaw.Shared.Tests/ExecApprovalV2UiPromptHandlerTests.cs b/tests/OpenClaw.Shared.Tests/ExecApprovalV2UiPromptHandlerTests.cs
+index fb7b15f..3a550f8 100644
+--- a/tests/OpenClaw.Shared.Tests/ExecApprovalV2UiPromptHandlerTests.cs
++++ b/tests/OpenClaw.Shared.Tests/ExecApprovalV2UiPromptHandlerTests.cs
+@@ -48,7 +48,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(), cts.Token);
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, result);
+         Assert.False(enqueueInvoked);
+     }
+ 
+@@ -64,7 +64,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var completed = await Task.WhenAny(promptTask, Task.Delay(TimeSpan.FromSeconds(5)));
+         Assert.Same(promptTask, completed);
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, await promptTask);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, await promptTask);
+     }
+ 
+     [Fact]
+@@ -88,7 +88,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request());
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, result);
+     }
+ 
+     [Fact]
+@@ -104,7 +104,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+         var result = await handler.PromptAsync(
+             Request(command: "echo API_SECRET=sk-abc123456789012345678"));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -139,7 +139,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+         var result = await handler.PromptAsync(
+             Request(command: "powershell -Command https://example.test/search?code=abc;Remove-Item"));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -158,7 +158,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(command: command));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -177,7 +177,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(command: command));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -195,7 +195,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(command: command));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -215,7 +215,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(command: command));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -234,7 +234,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(command: command));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -255,7 +255,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(command: command));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -278,7 +278,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(command: command));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, result);
+         Assert.False(dialogShown);
+     }
+ 
+@@ -310,7 +310,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request());
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, result);
+     }
+ 
+     [Fact]
+@@ -324,7 +324,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request());
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, result);
+     }
+ 
+     [Theory]
+@@ -348,7 +348,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request());
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, result);
+         Assert.Contains(logger.Errors, m => m.Contains("Allow"));
+     }
+ 
+@@ -487,7 +487,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+         // Exceeds the 256KB hard display cap: cannot be reviewed in full, so it must not be approvable.
+         var outcome = await handler.PromptAsync(Request(command: new string('a', 300_000)));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, outcome);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, outcome);
+         Assert.False(shown);
+     }
+ 
+@@ -500,7 +500,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+         // Exceeds the 16KB soft cap: the tail would be hidden behind truncation, so deny.
+         var outcome = await handler.PromptAsync(Request(command: new string('a', 20_000)));
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, outcome);
++        Assert.Equal(ExecApprovalPromptOutcome.Unreviewable, outcome);
+         Assert.False(shown);
+     }
+ 
+@@ -516,7 +516,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var promptTask = handler.PromptAsync(Request(), cts.Token);
+         cts.Cancel();
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, await promptTask);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, await promptTask);
+ 
+         // The dispatcher runs the queued work only after the cancellation already
+         // denied the request: the dialog must never be shown.
+@@ -540,7 +540,7 @@ public class ExecApprovalV2UiPromptHandlerTests
+ 
+         var result = await handler.PromptAsync(Request(), cts.Token);
+ 
+-        Assert.Equal(ExecApprovalPromptOutcome.Deny, result);
++        Assert.Equal(ExecApprovalPromptOutcome.Unavailable, result);
+         Assert.False(dialogInvoked);
+     }
+ 
+diff --git a/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs b/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs
+index 3eb98fa..788dba9 100644
+--- a/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs
++++ b/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs
+@@ -243,16 +243,31 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+         Assert.Contains("fallbackUsed=True", log.LastInfo, StringComparison.Ordinal);
+     }
+ 
+-    // ── 6. canPresent=true, NullPromptHandler → UserDenied ───────────────────
++    // ── 6. canPresent=true, NullPromptHandler → Unavailable ───────────────────
+ 
+     [Fact]
+-    public async Task CanPresent_NullPrompt_ReturnsUserDenied()
++    public async Task CanPresent_NullPrompt_ReturnsUnavailable()
+     {
+         WriteStoreFile("""{"version":1,"defaults":{"security":"full","ask":"always"}}""");
+         var result = await MakeCoordinator(
+             canPresent: AlwaysCanPresentEvaluator.Instance,
+             prompt: ExecApprovalV2NullPromptHandler.Instance).HandleAsync(DefaultReq(), "c6");
+-        Assert.Equal(ExecApprovalV2Code.UserDenied, result.Code);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, result.Code);
++    }
++
++    [Theory]
++    [InlineData(ExecApprovalPromptOutcome.Unavailable, ExecApprovalV2Code.Unavailable, "prompt-unavailable")]
++    [InlineData(ExecApprovalPromptOutcome.Unreviewable, ExecApprovalV2Code.ValidationFailed, "command-unreviewable")]
++    public async Task NonhumanPromptOutcome_FailsClosedWithoutClaimingUserDenial(
++        ExecApprovalPromptOutcome outcome, ExecApprovalV2Code expectedCode, string expectedReason)
++    {
++        WriteStoreFile("""{"version":1,"defaults":{"security":"full","ask":"always","askFallback":"full"}}""");
++        var result = await MakeCoordinator(
++            canPresent: AlwaysCanPresentEvaluator.Instance,
++            prompt: new FixedDecisionPromptHandler(outcome)).HandleAsync(DefaultReq(), "nonhuman");
++        Assert.Equal(expectedCode, result.Code);
++        Assert.Equal(expectedReason, result.Reason);
++        Assert.Null(result.Execution);
+     }
+ 
+     // ── AllowAlways availability plumbed into the prompt request (macOS parity) ──
+@@ -358,7 +373,7 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+     }
+ 
+     [Fact]
+-    public async Task Prompt_Timeout_ResolvesDeny()
++    public async Task Prompt_Timeout_IsUnavailableNotHumanDenial()
+     {
+         // A dialog the owner never answers must not hang the request: the prompt timeout
+         // cancels it and the coordinator denies.
+@@ -367,7 +382,8 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+             canPresent: AlwaysCanPresentEvaluator.Instance,
+             prompt: new TokenAwaitingPromptHandler(),
+             promptTimeout: TimeSpan.FromMilliseconds(50)).HandleAsync(DefaultReq(), "to1");
+-        Assert.False(result.IsAllow);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, result.Code);
++        Assert.Equal("prompt-timed-out", result.Reason);
+     }
+ 
+     // ── Security-audit-suppression gate (macOS parity) ──
+@@ -454,10 +470,10 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+         Assert.Equal("prompt-returned-allow", result.Reason);
+     }
+ 
+-    // ── 10. Prompt throws → UserDenied, no fallback ───────────────────────────
++    // ── 10. Prompt throws → Unavailable, no fallback ───────────────────────────
+ 
+     [Fact]
+-    public async Task PromptThrows_ReturnsUserDenied_FallbackNotUsed()
++    public async Task PromptThrows_ReturnsUnavailable_FallbackNotUsed()
+     {
+         WriteStoreFile("""{"version":1,"defaults":{"security":"full","ask":"always"}}""");
+         var log = new CapturingLogger();
+@@ -465,7 +481,7 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+             canPresent: AlwaysCanPresentEvaluator.Instance,
+             prompt: new ThrowingPromptHandler(),
+             logger: log).HandleAsync(DefaultReq(), "c10");
+-        Assert.Equal(ExecApprovalV2Code.UserDenied, result.Code);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, result.Code);
+         Assert.Equal("prompt-failed", result.Reason);
+         // Must not delegate to fallback after presenter failure
+         Assert.Contains("fallbackUsed=False", log.LastWarn!, StringComparison.Ordinal);
+@@ -592,11 +608,11 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+             prompt: new ThrowingPromptHandler());
+ 
+         var first = await coordinator.HandleAsync(DefaultReq(), "lock-1");
+-        Assert.Equal(ExecApprovalV2Code.UserDenied, first.Code);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, first.Code);
+ 
+         // Second call must complete — if lock was not released this would deadlock
+         var second = await coordinator.HandleAsync(DefaultReq(), "lock-2");
+-        Assert.Equal(ExecApprovalV2Code.UserDenied, second.Code);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, second.Code);
+     }
+ 
+     // ── 21a. Concurrency with actual lock contention ───────────────────────────
+@@ -605,7 +621,7 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+     public async Task Concurrency_PromptPathWithLockContention_AllReturnValidResults()
+     {
+         // ask=always + canPresent=true → all requests enter the locked block
+-        // NullPromptHandler returns Deny → all should be UserDenied (no deadlock, no corruption)
++        // NullPromptHandler returns Unavailable → all should be Unavailable (no deadlock, no corruption)
+         WriteStoreFile("""{"version":1,"defaults":{"security":"full","ask":"always"}}""");
+         var coordinator = MakeCoordinator(canPresent: AlwaysCanPresentEvaluator.Instance);
+         var tasks = Enumerable.Range(0, 5)
+@@ -613,8 +629,8 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+             .ToList();
+         var results = await Task.WhenAll(tasks);
+         Assert.All(results, r => Assert.NotNull(r));
+-        // NullPromptHandler returns Deny → UserDenied for all
+-        Assert.All(results, r => Assert.Equal(ExecApprovalV2Code.UserDenied, r.Code));
++        // NullPromptHandler returns Unavailable for all
++        Assert.All(results, r => Assert.Equal(ExecApprovalV2Code.Unavailable, r.Code));
+     }
+ 
+     // ExecApprovalV2Result — new codes constructible (InternalError, Allow)
 diff --git a/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs b/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs
-index e70d9747..e0fb3c05 100644
+index e70d974..e0fb3c0 100644
 --- a/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs
 +++ b/tests/OpenClaw.Tray.Tests/InstallerIssAssertionTests.cs
 @@ -222,7 +222,7 @@ public sealed class InstallerIssAssertionTests
@@ -449,12 +999,103 @@ index e70d9747..e0fb3c05 100644
              "-File", script,
              "-NoBuild",
              "-Configuration", "Release",
+diff --git a/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticeFlowTests.cs b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticeFlowTests.cs
+new file mode 100644
+index 0000000..e260601
+--- /dev/null
++++ b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticeFlowTests.cs
+@@ -0,0 +1,85 @@
++using System;
++using System.Threading;
++using System.Threading.Tasks;
++using OpenClawTray.Services;
++using Xunit;
++
++namespace OpenClaw.Tray.Tests.Services;
++
++public sealed class ApprovalNoticeFlowTests
++{
++    [Fact]
++    public async Task DecisionDoesNotReturnOrReleaseNoticeUntilActualClosedSignal()
++    {
++        var lease = new FakeLease();
++        var window = new FakeWindow();
++        var run = ApprovalNoticeFlow.RunAsync(lease, RunInline, () => window, CancellationToken.None);
++        await window.Shown.WaitAsync(TimeSpan.FromSeconds(1));
++        window.Decide(1);
++        Assert.False(run.IsCompleted);
++        Assert.Equal(0, lease.ReleaseCount);
++        window.SignalClosed();
++        Assert.Equal(1, await run.WaitAsync(TimeSpan.FromSeconds(1)));
++        Assert.Equal(1, lease.ReleaseCount);
++        Assert.Equal(0, lease.AbandonCount);
++    }
++
++    [Fact]
++    public async Task LostNoticeWithUnconfirmedWindowNeverReleasesAsSuccess()
++    {
++        var lease = new FakeLease();
++        var window = new FakeWindow();
++        var run = ApprovalNoticeFlow.RunAsync(lease, RunInline, () => window,
++            CancellationToken.None, TimeSpan.FromMilliseconds(25));
++        await window.Shown.WaitAsync(TimeSpan.FromSeconds(1));
++        lease.Lose();
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(TimeSpan.FromSeconds(1)));
++        Assert.True(window.CloseCount > 0);
++        Assert.Equal(0, lease.ReleaseCount);
++        Assert.Equal(1, lease.AbandonCount);
++    }
++
++    [Fact]
++    public async Task CancellationBeforeQueuedConstructionCannotCreateCard()
++    {
++        var lease = new FakeLease();
++        using var cancellation = new CancellationTokenSource();
++        Action? queued = null;
++        var creates = 0;
++        var run = ApprovalNoticeFlow.RunAsync(lease, action => { queued = action; return true; },
++            () => { creates++; return new FakeWindow(); }, cancellation.Token);
++        cancellation.Cancel();
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(TimeSpan.FromSeconds(1)));
++        Assert.NotNull(queued);
++        queued!();
++        Assert.Equal(0, creates);
++        Assert.Equal(1, lease.ReleaseCount);
++    }
++
++    private static bool RunInline(Action action) { action(); return true; }
++
++    private sealed class FakeLease : IApprovalNoticeLease
++    {
++        private readonly CancellationTokenSource _lost = new();
++        public CancellationToken Lost => _lost.Token;
++        public int ReleaseCount { get; private set; }
++        public int AbandonCount { get; private set; }
++        public void Lose() => _lost.Cancel();
++        public Task ReleaseAsync() { ReleaseCount++; return Task.CompletedTask; }
++        public void Abandon() => AbandonCount++;
++    }
++
++    private sealed class FakeWindow : IApprovalNoticeWindow<int>
++    {
++        private readonly TaskCompletionSource<int> _decision = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        private readonly TaskCompletionSource<bool> _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        private readonly TaskCompletionSource<bool> _shown = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        public Task Shown => _shown.Task;
++        public Task Closed => _closed.Task;
++        public int CloseCount { get; private set; }
++        public Task<int> ShowAsync() { _shown.TrySetResult(true); return _decision.Task; }
++        public void Decide(int value) => _decision.TrySetResult(value);
++        public void SignalClosed() => _closed.TrySetResult(true);
++        public void Close() => CloseCount++;
++    }
++}
 diff --git a/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs
 new file mode 100644
-index 00000000..89b3992a
+index 0000000..62134da
 --- /dev/null
 +++ b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,45 @@
 +using System.IO;
 +using Xunit;
 +namespace OpenClaw.Tray.Tests.Services;
@@ -472,13 +1113,18 @@ index 00000000..89b3992a
 +        Assert.DoesNotContain("Activate()", code);
 +        Assert.Contains("AppWindow.Move(", code);
 +    }
-+    [Fact] public void DecisionGuardStartsAtShowAndPreservesThreeSeconds()
++    [Fact] public void DecisionGuardStartsAfterFirstRenderAndPreservesThreeSeconds()
 +    {
 +        var code = Read("Dialogs", "ExecApprovalDialog.cs");
 +        Assert.Contains("TimeSpan.FromSeconds(3)", code);
++        Assert.Contains("CompositionTarget.Rendering += OnFirstRendering", code);
++        Assert.Contains("CompositionTarget.Rendering -= OnFirstRendering", code);
 +        var show = code.Substring(code.IndexOf("public Task<ExecApprovalPromptOutcome> ShowAsync()"));
-+        Assert.True(show.IndexOf("ArmAllowGuard();") < show.IndexOf("AppWindow.Show(false)"));
-+        Assert.DoesNotContain("ArmAllowGuard();", code.Substring(0, code.IndexOf("public Task<ExecApprovalPromptOutcome> ShowAsync()")));
++        Assert.True(show.IndexOf("AppWindow.Show(false)") < show.IndexOf("_showRequested = true;"));
++        var firstRender = show.Substring(show.IndexOf("private void OnFirstRendering"));
++        Assert.True(firstRender.IndexOf("_showRequested") < firstRender.IndexOf("ArmAllowGuard();"));
++        Assert.DoesNotContain("ArmAllowGuard();", code.Substring(0, code.IndexOf("private void OnFirstRendering")));
++        Assert.Equal(3, System.Text.RegularExpressions.Regex.Matches(code, "IsEnabled = false").Count);
 +        Assert.Contains("if (IsClosed || !_delayElapsed) return;", code);
 +        Assert.Contains("outcome != ExecApprovalPromptOutcome.Deny && !_commandFullySeen", code);
 +        Assert.Contains("if (!_delayElapsed || _commandFullySeen || _bodyScroll is null) return;", code);

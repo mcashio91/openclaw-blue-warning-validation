@@ -47,7 +47,7 @@ jobs:
           $canonical = [IO.File]::ReadAllText($patch).Replace("`r`n", "`n")
           [IO.File]::WriteAllText($patch, $canonical, [Text.UTF8Encoding]::new($false))
           $digest = (Get-FileHash $patch -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($digest -ne '6f7f044e3f08116f83b368645fbc546acc88f252192fc444bc935992fbfbc728') { throw 'Repair patch mismatch' }
+          if ($digest -ne '65344c084e5d83a648f50c0e5abf9c32d0d097d72e45cba74a92486ebe27c658') { throw 'Repair patch mismatch' }
           git apply --check ../proposal/blue-repair.patch
           if ($LASTEXITCODE -ne 0) { throw 'Patch does not apply' }
           git apply ../proposal/blue-repair.patch
