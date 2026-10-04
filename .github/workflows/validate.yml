@@ -18,7 +18,7 @@ jobs:
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       OPENCLAW_REPO_ROOT: ${{ github.workspace }}\source
-      OPENCLAW_TRAY_DATA_DIR: ${{ runner.temp }}\blue-test-data
+      OPENCLAW_TRAY_DATA_DIR: ${{ github.workspace }}\blue-test-data
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
