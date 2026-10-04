@@ -41,7 +41,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $head = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $head -ne '3c43751b2bace876de3febe478ebabeca172e3ac') { throw 'Source identity mismatch' }
-          $digest = (Get-FileHash ../proposal/blue-repair.patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          # Windows checkout can translate LF to CRLF. Restore canonical patch bytes
+          # before verifying the exact reviewed SHA-256; source checkout stays native.
+          $patch = [IO.Path]::GetFullPath('../proposal/blue-repair.patch')
+          $canonical = [IO.File]::ReadAllText($patch).Replace("`r`n", "`n")
+          [IO.File]::WriteAllText($patch, $canonical, [Text.UTF8Encoding]::new($false))
+          $digest = (Get-FileHash $patch -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -ne '6f7f044e3f08116f83b368645fbc546acc88f252192fc444bc935992fbfbc728') { throw 'Repair patch mismatch' }
           git apply --check ../proposal/blue-repair.patch
           if ($LASTEXITCODE -ne 0) { throw 'Patch does not apply' }
