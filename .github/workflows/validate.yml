@@ -54,6 +54,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Patch failed' }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw 'Diff check failed' }
+          # Only this exact, hash-verified checkout on the disposable CI runner.
+          # checkout's temporary Git HOME is not used by GitVersion in build.ps1.
+          git config --global --add safe.directory ($env:OPENCLAW_REPO_ROOT.Replace('\', '/'))
+          if ($LASTEXITCODE -ne 0) { throw 'Could not register owned CI checkout' }
       - name: Required upstream build
         shell: pwsh
         working-directory: source
