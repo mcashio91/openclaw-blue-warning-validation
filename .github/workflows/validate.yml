@@ -47,7 +47,7 @@ jobs:
           $canonical = [IO.File]::ReadAllText($patch).Replace("`r`n", "`n")
           [IO.File]::WriteAllText($patch, $canonical, [Text.UTF8Encoding]::new($false))
           $digest = (Get-FileHash $patch -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($digest -ne '768c35373d11cf3968ecdbd871bc32a14dd2161dc8af3f799af8592ad5e4a8a6') { throw 'Repair patch mismatch' }
+          if ($digest -ne 'eb45a23916d88eb2d5926536ad47792fdd61243ba322c24ac419ae8b93d37cfe') { throw 'Repair patch mismatch' }
           git apply --check ../proposal/blue-repair.patch
           if ($LASTEXITCODE -ne 0) { throw 'Patch does not apply' }
           git apply ../proposal/blue-repair.patch
@@ -67,28 +67,84 @@ jobs:
           [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) 'tests/NativeApprovalProof/Invoke-IsolatedNativeProof.ps1'), [ref]$tokens, [ref]$parseErrors)
           if ($parseErrors.Count -ne 0) { throw ($parseErrors | Out-String) }
           $env:AGRIPPA_NATIVE_APPROVAL_PROOF = $null
-          dotnet build tests/OpenClaw.Tray.UITests/OpenClaw.Tray.UITests.csproj -c Debug -r win-x64
+          $uiLog = Join-Path $env:RUNNER_TEMP 'ui-compile.log'
+          dotnet build tests/OpenClaw.Tray.UITests/OpenClaw.Tray.UITests.csproj -c Debug -r win-x64 | Tee-Object -FilePath $uiLog
           if ($LASTEXITCODE -ne 0) { throw 'Native proof compile failed' }
+          $uiText = Get-Content $uiLog -Raw
+          $uiErr = [regex]::Matches($uiText, '(\d+) Error\(s\)') | Select-Object -Last 1
+          $uiWarn = [regex]::Matches($uiText, '(\d+) Warning\(s\)') | Select-Object -Last 1
+          Write-Host "::notice title=Native proof compile::errors=$($uiErr.Groups[1].Value) warnings=$($uiWarn.Groups[1].Value)"
           $dll = 'tests/OpenClaw.Tray.UITests/bin/Debug/net10.0-windows10.0.22621.0/win-x64/OpenClaw.Tray.UITests.dll'
           if (-not (Test-Path $dll)) { throw 'Native proof assembly missing' }
           Get-FileHash $dll -Algorithm SHA256
-          & "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:tests/NativeApprovalProof/ApprovalNotice.exe tests/NativeApprovalProof/ApprovalNotice.cs
-          if ($LASTEXITCODE -ne 0) { throw 'Native blue helper compile failed' }
-          node tests/NativeApprovalProof/proof.mjs
+          Push-Location tests/NativeApprovalProof
+          try {
+            & "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:ApprovalNotice.exe ApprovalNotice.cs
+            if ($LASTEXITCODE -ne 0) { throw 'Native blue helper compile failed' }
+          } finally { Pop-Location }
+          $proofOut = node tests/NativeApprovalProof/proof.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Helper protocol test failed' }
-          node tests/NativeApprovalProof/test-receipt.mjs
+          Write-Host "::notice title=Helper protocol test::$proofOut"
+          $receiptOut = node tests/NativeApprovalProof/test-receipt.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Durable release receipt test failed' }
+          Write-Host "::notice title=Release receipt test::$receiptOut"
       - name: Required upstream build
         shell: pwsh
         working-directory: source
-        run: ./build.ps1 -Project All -Configuration Release -NoTrustRepository
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bLog = Join-Path $env:RUNNER_TEMP 'upstream-build.log'
+          ./build.ps1 -Project All -Configuration Release -NoTrustRepository | Tee-Object -FilePath $bLog
+          $bCode = $LASTEXITCODE
+          $bText = Get-Content $bLog -Raw
+          $bErr = [regex]::Matches($bText, '(\d+) Error\(s\)') | Select-Object -Last 1
+          $bWarn = [regex]::Matches($bText, '(\d+) Warning\(s\)') | Select-Object -Last 1
+          $bOk = [regex]::IsMatch($bText, 'Build succeeded')
+          Write-Host "::notice title=Upstream build::exit=$bCode succeeded=$bOk errors=$($bErr.Groups[1].Value) warnings=$($bWarn.Groups[1].Value)"
+          if ($null -ne $bCode -and $bCode -ne 0) { throw "Upstream build failed: exit=$bCode" }
       - name: Shared tests
         shell: pwsh
         working-directory: source
-        run: dotnet test tests/OpenClaw.Shared.Tests -c Release --logger "console;verbosity=normal"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:RUNNER_TEMP 'shared-tests.log'
+          dotnet test tests/OpenClaw.Shared.Tests -c Release --logger "console;verbosity=normal" | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $text = Get-Content $log -Raw
+          $total = [regex]::Matches($text, 'Total tests:\s+(\d+)') | Select-Object -Last 1
+          $passed = [regex]::Matches($text, '(?m)^\s*Passed:\s+(\d+)') | Select-Object -Last 1
+          $failed = [regex]::Matches($text, '(?m)^\s*Failed:\s+(\d+)') | Select-Object -Last 1
+          $skipped = [regex]::Matches($text, '(?m)^\s*Skipped:\s+(\d+)') | Select-Object -Last 1
+          $t = if ($total) { [int]$total.Groups[1].Value } else { 0 }
+          $p = if ($passed) { [int]$passed.Groups[1].Value } else { 0 }
+          $f = if ($failed) { [int]$failed.Groups[1].Value } else { 0 }
+          $s = if ($skipped) { [int]$skipped.Groups[1].Value } else { 0 }
+          $line = "Shared tests exit=$code total=$t passed=$p failed=$f skipped=$s"
+          Write-Host "::notice title=Shared tests counts::$line"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line
+          if ($code -ne 0) { throw "Shared tests failed: $line" }
+          if ($t -le 0 -or $p -le 0 -or $f -ne 0) { throw "Shared tests counts invalid: $line" }
       - name: Tray tests
         shell: pwsh
         working-directory: source
-        run: dotnet test tests/OpenClaw.Tray.Tests -c Release -r win-x64 --logger "console;verbosity=normal"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:RUNNER_TEMP 'tray-tests.log'
+          dotnet test tests/OpenClaw.Tray.Tests -c Release -r win-x64 --logger "console;verbosity=normal" | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $text = Get-Content $log -Raw
+          $total = [regex]::Matches($text, 'Total tests:\s+(\d+)') | Select-Object -Last 1
+          $passed = [regex]::Matches($text, '(?m)^\s*Passed:\s+(\d+)') | Select-Object -Last 1
+          $failed = [regex]::Matches($text, '(?m)^\s*Failed:\s+(\d+)') | Select-Object -Last 1
+          $skipped = [regex]::Matches($text, '(?m)^\s*Skipped:\s+(\d+)') | Select-Object -Last 1
+          $t = if ($total) { [int]$total.Groups[1].Value } else { 0 }
+          $p = if ($passed) { [int]$passed.Groups[1].Value } else { 0 }
+          $f = if ($failed) { [int]$failed.Groups[1].Value } else { 0 }
+          $s = if ($skipped) { [int]$skipped.Groups[1].Value } else { 0 }
+          $line = "Tray tests exit=$code total=$t passed=$p failed=$f skipped=$s"
+          Write-Host "::notice title=Tray tests counts::$line"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line
+          if ($code -ne 0) { throw "Tray tests failed: $line" }
+          if ($t -le 0 -or $p -le 0 -or $f -ne 0) { throw "Tray tests counts invalid: $line" }
 # No deployment, secrets, artifact uploads, caches, releases, or policy overrides.
 # Passing here is not proof of the installed PC's visual timing or focus behavior.

@@ -128,7 +128,7 @@ index 5161cf8..fcfe3b2 100644
      }
  }
 diff --git a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs
-index 83d864d..0955bc3 100644
+index 83d864d..d34d53b 100644
 --- a/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs
 +++ b/src/OpenClaw.Shared/ExecApprovals/ExecApprovalsCoordinator.cs
 @@ -172,24 +172,43 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
@@ -181,19 +181,39 @@ index 83d864d..0955bc3 100644
                  // Allow (plain) from a prompt handler is an invariant violation —
                  // only AllowOnce and AllowAlways are semantically valid from UI.
                  if (promptResult == ExecApprovalPromptOutcome.Allow)
+@@ -214,14 +233,15 @@ public sealed class ExecApprovalsCoordinator : IExecApprovalV2Handler
+             }
+             else
+             {
+-                fallbackUsed = true;
+                 // An audit-suppression change requires explicit human approval; with no UI
+-                // available, deny rather than delegate to askFallback (which may be permissive).
++                // available, fail closed as unavailable. No person denied it, and
++                // askFallback (which may be permissive) was never consulted.
+                 if (auditForcedApproval)
+                     return LogAndReturn(
+-                        ExecApprovalV2Result.UserDenied("audit-suppression-requires-approval"),
+-                        correlationId, promptAttempted, fallbackUsed: true,
++                        ExecApprovalV2Result.Unavailable("audit-suppression-requires-approval"),
++                        correlationId, promptAttempted, fallbackUsed: false,
+                         canonical: context.DisplayCommand);
++                fallbackUsed = true;
+                 followupDecision = FallbackDecision(
+                     context,
+                     resolved.Defaults.AskFallback,
 diff --git a/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs b/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
-index 046e67f..3bcbb11 100644
+index 046e67f..a0b37b9 100644
 --- a/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
 +++ b/src/OpenClaw.Tray.WinUI/Dialogs/ExecApprovalDialog.cs
-@@ -6,7 +6,6 @@ using OpenClawTray.Controls;
+@@ -6,6 +6,7 @@ using OpenClawTray.Controls;
  using OpenClawTray.Helpers;
  using OpenClawTray.Services;
  using System;
--using System.Runtime.InteropServices;
++using System.Diagnostics;
+ using System.Runtime.InteropServices;
  using System.Threading.Tasks;
  using WinUIEx;
- 
-@@ -18,23 +17,12 @@ namespace OpenClawTray.Dialogs;
+@@ -18,29 +19,20 @@ namespace OpenClawTray.Dialogs;
  /// Allow Always.
  ///
  /// Security posture: the allow buttons are never default-focused and stay disabled for
@@ -220,16 +240,24 @@ index 046e67f..3bcbb11 100644
  
      private readonly TaskCompletionSource<ExecApprovalPromptOutcome> _tcs =
          new(TaskCreationOptions.RunContinuationsAsynchronously);
-@@ -50,6 +38,8 @@ public sealed class ExecApprovalDialog : WindowEx
+     private readonly Button _denyButton;
+     private readonly Button _allowOnceButton;
+     private readonly Button _allowAlwaysButton;
++    private readonly Grid _windowContent;
++    private readonly Stopwatch _armClock = new();
+ 
+     private DispatcherTimer? _armTimer;
+     private ExecApprovalPromptOutcome _outcome = ExecApprovalPromptOutcome.Deny;
+@@ -50,6 +42,8 @@ public sealed class ExecApprovalDialog : WindowEx
      private ScrollViewer? _bodyScroll;
      private bool _delayElapsed;
      private bool _commandFullySeen;
 +    private bool _showRequested;
-+    private bool _firstRenderObserved;
++    private bool _presentationFenceQueued;
      private readonly bool _allowAlwaysAvailable;
  
      public bool IsClosed { get; private set; }
-@@ -63,7 +53,13 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -63,7 +57,13 @@ public sealed class ExecApprovalDialog : WindowEx
          var windowTitle = $"{AppIdentity.DisplayName} - {LocalizationHelper.GetString("ExecApproval_WindowTitle")}";
          Title = windowTitle;
          this.SetWindowSize(520, 400);
@@ -244,7 +272,7 @@ index 046e67f..3bcbb11 100644
          this.SetIcon("Assets\\openclaw.ico");
          SystemBackdrop = new MicaBackdrop();
          ExtendsContentIntoTitleBar = true;
-@@ -178,13 +174,13 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -178,13 +178,13 @@ public sealed class ExecApprovalDialog : WindowEx
          buttonGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
          buttonGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
  
@@ -260,7 +288,7 @@ index 046e67f..3bcbb11 100644
          Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(_allowAlwaysButton, "ExecApprovalAllowAlwaysAction");
          _allowAlwaysButton.Click += (_, _) => Decide(ExecApprovalPromptOutcome.AllowAlways);
          Grid.SetColumn(_allowAlwaysButton, 2);
-@@ -199,6 +195,7 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -199,6 +199,7 @@ public sealed class ExecApprovalDialog : WindowEx
          {
              Content = LocalizationHelper.GetString("ExecApproval_AllowOnce"),
              Style = (Style)Application.Current.Resources["AccentButtonStyle"],
@@ -268,21 +296,23 @@ index 046e67f..3bcbb11 100644
          };
          Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(_allowOnceButton, "ExecApprovalAllowOnceAction");
          _allowOnceButton.Click += (_, _) => Decide(ExecApprovalPromptOutcome.AllowOnce);
-@@ -211,6 +208,13 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -210,7 +211,15 @@ public sealed class ExecApprovalDialog : WindowEx
+ 
          Grid.SetRow(root, 1);
          outerGrid.Children.Add(root);
++        _windowContent = outerGrid;
          Content = outerGrid;
-+        // Loaded can precede display. The first Rendering callback after Show(false)
-+        // starts the decision clock; construction and Show() time cannot arm it.
++        // Loaded can precede display. Rendering is global and pre-presentation, so
++        // it only queues a post-callback compositor fence for this visible window.
 +        outerGrid.Loaded += (_, _) =>
 +        {
-+            if (!IsClosed)
++            if (!IsClosed && !_presentationFenceQueued)
 +                CompositionTarget.Rendering += OnFirstRendering;
 +        };
  
          // Escape denies from anywhere in the window.
          var escAccel = new Microsoft.UI.Xaml.Input.KeyboardAccelerator
-@@ -227,52 +231,47 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -227,62 +236,143 @@ public sealed class ExecApprovalDialog : WindowEx
              Microsoft.UI.Xaml.Input.KeyboardAcceleratorPlacementMode.Hidden;
  
          Closed += OnWindowClosed;
@@ -298,36 +328,91 @@ index 046e67f..3bcbb11 100644
      public Task<ExecApprovalPromptOutcome> ShowAsync()
      {
 -        Activate();
--        try
--        {
--            var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
++        AppWindow.Show(false);
++        _showRequested = true;
++        return _tcs.Task;
++    }
++
++    private void OnFirstRendering(object? sender, object e)
++    {
++        if (_presentationFenceQueued || !IsPresentationReady()) return;
++        _presentationFenceQueued = true;
++        CompositionTarget.Rendering -= OnFirstRendering;
++        // This callback fires before frame submission. Defer the compositor fence
++        // until the callback returns; failure to schedule it is not human denial.
++        try
++        {
++            if (!_windowContent.DispatcherQueue.TryEnqueue(CompletePresentationFence))
++                FailPresentation();
++        }
++        catch
++        {
++            FailPresentation();
++        }
++    }
++
++    private bool IsPresentationReady()
++    {
++        if (!_showRequested || IsClosed || !_windowContent.IsLoaded
++            || _windowContent.ActualWidth <= 0 || _windowContent.ActualHeight <= 0)
++            return false;
++
+         try
+         {
+             var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
 -            if (hwnd != IntPtr.Zero)
--            {
++            return hwnd != IntPtr.Zero && IsWindowVisible(hwnd);
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    private void CompletePresentationFence()
++    {
++        if (!IsPresentationReady())
++        {
++            FailPresentation();
++            return;
++        }
++
++        try
++        {
++            // DwmFlush waits for this process's already-queued DirectX changes to
++            // reach the screen. Rendering alone does not provide that guarantee.
++            if (DwmFlush() != 0 || !IsPresentationReady())
+             {
 -                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 -                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 -                SetForegroundWindow(hwnd);
--            }
--        }
++                FailPresentation();
++                return;
+             }
+         }
 -        catch { /* best-effort */ }
--
++        catch
++        {
++            FailPresentation();
++            return;
++        }
+ 
 -        // Initial focus lands on Deny so Enter can never approve.
 -        _denyButton.Focus(FocusState.Programmatic);
-+        AppWindow.Show(false);
-+        _showRequested = true;
-         return _tcs.Task;
+-        return _tcs.Task;
++        ArmAllowGuard();
      }
  
-+    private void OnFirstRendering(object? sender, object e)
-+    {
-+        if (!_showRequested || _firstRenderObserved || IsClosed) return;
-+        _firstRenderObserved = true;
-+        CompositionTarget.Rendering -= OnFirstRendering;
-+        ArmAllowGuard();
+-    private void Decide(ExecApprovalPromptOutcome outcome)
++    private void FailPresentation()
+     {
+         if (IsClosed) return;
++        _outcome = ExecApprovalPromptOutcome.Unavailable;
++        Close();
 +    }
 +
-     private void Decide(ExecApprovalPromptOutcome outcome)
-     {
--        if (IsClosed) return;
++    private void Decide(ExecApprovalPromptOutcome outcome)
++    {
 +        if (IsClosed || !_delayElapsed) return;
 +        if (outcome != ExecApprovalPromptOutcome.Deny && !_commandFullySeen) return;
          _outcome = outcome;
@@ -343,17 +428,48 @@ index 046e67f..3bcbb11 100644
 -        _allowAlwaysButton.IsEnabled = false;
          MaybeArmAllow();
 -        _armTimer = new DispatcherTimer { Interval = AllowArmDelay };
+-        _armTimer.Tick += (_, _) =>
+-        {
+-            _armTimer?.Stop();
+-            _delayElapsed = true;
+-            MaybeArmAllow();
+-        };
 +        _armTimer = new DispatcherTimer { Interval = DecisionArmDelay };
-         _armTimer.Tick += (_, _) =>
-         {
-             _armTimer?.Stop();
-             _delayElapsed = true;
-+            _denyButton.IsEnabled = true;
-+            UpdateCommandSeen();
-             MaybeArmAllow();
-         };
++        _armTimer.Tick += OnArmTimerTick;
++        _armClock.Restart();
          _armTimer.Start();
-@@ -282,7 +281,9 @@ public sealed class ExecApprovalDialog : WindowEx
+     }
+ 
++    private void OnArmTimerTick(object? sender, object e)
++    {
++        _armTimer?.Stop();
++        if (IsClosed) return;
++        if (!IsPresentationReady())
++        {
++            FailPresentation();
++            return;
++        }
++
++        // DispatcherTimer schedules work, but Stopwatch supplies monotonic time.
++        // An early tick must not shorten the full three seconds.
++        var remaining = DecisionArmDelay - _armClock.Elapsed;
++        if (remaining > TimeSpan.Zero)
++        {
++            if (_armTimer is not null)
++            {
++                _armTimer.Interval = remaining;
++                _armTimer.Start();
++            }
++            return;
++        }
++
++        _delayElapsed = true;
++        _denyButton.IsEnabled = true;
++        UpdateCommandSeen();
++        MaybeArmAllow();
++    }
++
+     // A command that fits needs no scrolling; a long one must be scrolled to its end
      // before it counts as seen. Once seen it stays seen (scrolling back up is fine).
      private void UpdateCommandSeen()
      {
@@ -364,14 +480,30 @@ index 046e67f..3bcbb11 100644
          // Ignore pre-layout passes: until the ScrollViewer has actually measured its content
          // (non-zero viewport AND extent), a zero ScrollableHeight means "not laid out yet", not
          // "everything fits". Latching on that would arm the allow buttons for a long command the
-@@ -350,6 +351,7 @@ public sealed class ExecApprovalDialog : WindowEx
+@@ -350,6 +440,9 @@ public sealed class ExecApprovalDialog : WindowEx
      {
          IsClosed = true;
          _armTimer?.Stop();
++        if (_armTimer is not null)
++            _armTimer.Tick -= OnArmTimerTick;
 +        CompositionTarget.Rendering -= OnFirstRendering;
          Closed -= OnWindowClosed;
          _tcs.TrySetResult(_outcome);
      }
+@@ -359,6 +452,13 @@ public sealed class ExecApprovalDialog : WindowEx
+             ? brush
+             : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+ 
++    [DllImport("user32.dll")]
++    [return: MarshalAs(UnmanagedType.Bool)]
++    private static extern bool IsWindowVisible(IntPtr hwnd);
++
++    [DllImport("dwmapi.dll")]
++    private static extern int DwmFlush();
++
+     private static void AddContextRow(StackPanel parent, string labelKey, string? value)
+     {
+         if (string.IsNullOrWhiteSpace(value)) return;
 diff --git a/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs b/src/OpenClaw.Tray.WinUI/Services/ApprovalNoticeFlow.cs
 new file mode 100644
 index 0000000..b48cebe
@@ -750,7 +882,7 @@ index 0000000..984c6e2
 +}
 diff --git a/tests/NativeApprovalProof/Invoke-IsolatedNativeProof.ps1 b/tests/NativeApprovalProof/Invoke-IsolatedNativeProof.ps1
 new file mode 100644
-index 0000000..587514d
+index 0000000..dba6ef9
 --- /dev/null
 +++ b/tests/NativeApprovalProof/Invoke-IsolatedNativeProof.ps1
 @@ -0,0 +1,103 @@
@@ -767,7 +899,7 @@ index 0000000..587514d
 +$ErrorActionPreference = 'Stop'
 +if (-not $IsWindows) { throw 'This launcher is Windows-only.' }
 +$baseCommit = '3c43751b2bace876de3febe478ebabeca172e3ac'
-+$repairDigest = 'aeb0a18b9b22209a94d8b934bda928104552a91af6b9316dbe566e0e6e69b9d4'
++$repairDigest = '817fd6a0d9b0b0aa004250a65a9a4c375df873398a04548f291cf182857c3508'
 +$proofDigest = '2d20a60e42f5ed466cfaaafd7ff2e28698e2af1655c12931aaaab548265cc8c1'
 +$helperDigests = @{
 +    'ApprovalNotice.cs' = 'fa2a21f07d6fc1bcf4d2e236e78105a782e13d9684c7be68dd690af54a20303f'
@@ -1235,7 +1367,7 @@ index fb7b15f..3a550f8 100644
      }
  
 diff --git a/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs b/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs
-index 3eb98fa..788dba9 100644
+index 3eb98fa..2021297 100644
 --- a/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs
 +++ b/tests/OpenClaw.Shared.Tests/ExecApprovalsCoordinatorTests.cs
 @@ -243,16 +243,31 @@ public class ExecApprovalsCoordinatorTests : IDisposable
@@ -1292,7 +1424,65 @@ index 3eb98fa..788dba9 100644
      }
  
      // ── Security-audit-suppression gate (macOS parity) ──
-@@ -454,10 +470,10 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+@@ -383,32 +399,48 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+         // with no UI available it fails closed instead of auto-allowing.
+         var req = Req("""{"command":["where","security.audit.suppressions"]}""");
+         var result = await MakeCoordinator().HandleAsync(req, "aud1");
+-        Assert.False(result.IsAllow);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, result.Code);
+     }
+ 
+     [Fact]
+-    public async Task AuditSuppression_PermissiveFallback_StillDeniedWithoutUi()
++    public async Task AuditSuppression_PermissiveFallback_ReturnsUnavailableWithoutUi()
+     {
+-        // Even with askFallback=full, an audit-suppression change must never auto-allow without
+-        // an explicit decision: the audit gate denies rather than delegating to askFallback.
++        // Even with askFallback=full, an audit-suppression change cannot auto-allow.
++        // No prompt was shown and no fallback was consulted, so this is unavailable,
++        // not a human denial or a fallback decision.
+         WriteStoreFile("""{"version":1,"defaults":{"security":"full","ask":"off","askFallback":"full"}}""");
+         var req = Req("""{"command":["where","security.audit.suppressions"]}""");
+-        var result = await MakeCoordinator().HandleAsync(req, "audf1");
+-        Assert.False(result.IsAllow);
++        var log = new CapturingLogger();
++        var result = await MakeCoordinator(logger: log).HandleAsync(req, "audf1");
++        Assert.Equal(ExecApprovalV2Code.Unavailable, result.Code);
+         Assert.Equal("audit-suppression-requires-approval", result.Reason);
++        Assert.Null(result.Execution);
++        Assert.Contains("fallbackUsed=False", log.LastWarn!, StringComparison.Ordinal);
++        Assert.Contains("promptAttempted=False", log.LastWarn!, StringComparison.Ordinal);
+     }
+ 
+     [Fact]
+-    public async Task AuditSuppression_AskAlwaysPermissiveFallback_StillDeniedWithoutUi()
++    public async Task AuditSuppression_AskAlwaysPermissiveFallback_ReturnsUnavailableWithoutUi()
+     {
+         WriteStoreFile(
+             """{"version":1,"defaults":{"security":"full","ask":"always","askFallback":"full"}}""");
+         var req = Req("""{"command":["where","security.audit.suppressions"]}""");
+ 
+-        var result = await MakeCoordinator().HandleAsync(req, "audf2");
++        var log = new CapturingLogger();
++        var coordinator = MakeCoordinator(logger: log);
++        var result = await coordinator.HandleAsync(req, "audf2");
+ 
+-        Assert.False(result.IsAllow);
++        Assert.Equal(ExecApprovalV2Code.Unavailable, result.Code);
+         Assert.Equal("audit-suppression-requires-approval", result.Reason);
++        Assert.Null(result.Execution);
++        Assert.Contains("fallbackUsed=False", log.LastWarn!, StringComparison.Ordinal);
++        Assert.Contains("promptAttempted=False", log.LastWarn!, StringComparison.Ordinal);
++
++        // Control: the same permissive policy really does use fallback for a
++        // non-audit command when the UI cannot be presented.
++        var ordinary = await coordinator.HandleAsync(DefaultReq(), "audf2-control");
++        Assert.True(ordinary.IsAllow);
++        Assert.Contains("fallbackUsed=True", log.LastInfo!, StringComparison.Ordinal);
+     }
+ 
+     // ── 7. canPresent=true, AllowOnce → Allow ────────────────────────────────
+@@ -454,10 +486,10 @@ public class ExecApprovalsCoordinatorTests : IDisposable
          Assert.Equal("prompt-returned-allow", result.Reason);
      }
  
@@ -1305,7 +1495,7 @@ index 3eb98fa..788dba9 100644
      {
          WriteStoreFile("""{"version":1,"defaults":{"security":"full","ask":"always"}}""");
          var log = new CapturingLogger();
-@@ -465,7 +481,7 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+@@ -465,7 +497,7 @@ public class ExecApprovalsCoordinatorTests : IDisposable
              canPresent: AlwaysCanPresentEvaluator.Instance,
              prompt: new ThrowingPromptHandler(),
              logger: log).HandleAsync(DefaultReq(), "c10");
@@ -1314,7 +1504,7 @@ index 3eb98fa..788dba9 100644
          Assert.Equal("prompt-failed", result.Reason);
          // Must not delegate to fallback after presenter failure
          Assert.Contains("fallbackUsed=False", log.LastWarn!, StringComparison.Ordinal);
-@@ -592,11 +608,11 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+@@ -592,11 +624,11 @@ public class ExecApprovalsCoordinatorTests : IDisposable
              prompt: new ThrowingPromptHandler());
  
          var first = await coordinator.HandleAsync(DefaultReq(), "lock-1");
@@ -1328,7 +1518,7 @@ index 3eb98fa..788dba9 100644
      }
  
      // ── 21a. Concurrency with actual lock contention ───────────────────────────
-@@ -605,7 +621,7 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+@@ -605,7 +637,7 @@ public class ExecApprovalsCoordinatorTests : IDisposable
      public async Task Concurrency_PromptPathWithLockContention_AllReturnValidResults()
      {
          // ask=always + canPresent=true → all requests enter the locked block
@@ -1337,7 +1527,7 @@ index 3eb98fa..788dba9 100644
          WriteStoreFile("""{"version":1,"defaults":{"security":"full","ask":"always"}}""");
          var coordinator = MakeCoordinator(canPresent: AlwaysCanPresentEvaluator.Instance);
          var tasks = Enumerable.Range(0, 5)
-@@ -613,8 +629,8 @@ public class ExecApprovalsCoordinatorTests : IDisposable
+@@ -613,8 +645,8 @@ public class ExecApprovalsCoordinatorTests : IDisposable
              .ToList();
          var results = await Task.WhenAll(tasks);
          Assert.All(results, r => Assert.NotNull(r));
@@ -1467,10 +1657,10 @@ index 0000000..e260601
 +}
 diff --git a/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs
 new file mode 100644
-index 0000000..62134da
+index 0000000..89630db
 --- /dev/null
 +++ b/tests/OpenClaw.Tray.Tests/Services/ApprovalNoticePresentationContractTests.cs
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,72 @@
 +using System.IO;
 +using Xunit;
 +namespace OpenClaw.Tray.Tests.Services;
@@ -1488,7 +1678,7 @@ index 0000000..62134da
 +        Assert.DoesNotContain("Activate()", code);
 +        Assert.Contains("AppWindow.Move(", code);
 +    }
-+    [Fact] public void DecisionGuardStartsAfterFirstRenderAndPreservesThreeSeconds()
++    [Fact] public void DecisionGuardStartsOnlyAfterVisibleWindowPresentationFence()
 +    {
 +        var code = Read("Dialogs", "ExecApprovalDialog.cs");
 +        Assert.Contains("TimeSpan.FromSeconds(3)", code);
@@ -1496,9 +1686,36 @@ index 0000000..62134da
 +        Assert.Contains("CompositionTarget.Rendering -= OnFirstRendering", code);
 +        var show = code.Substring(code.IndexOf("public Task<ExecApprovalPromptOutcome> ShowAsync()"));
 +        Assert.True(show.IndexOf("AppWindow.Show(false)") < show.IndexOf("_showRequested = true;"));
-+        var firstRender = show.Substring(show.IndexOf("private void OnFirstRendering"));
-+        Assert.True(firstRender.IndexOf("_showRequested") < firstRender.IndexOf("ArmAllowGuard();"));
-+        Assert.DoesNotContain("ArmAllowGuard();", code.Substring(0, code.IndexOf("private void OnFirstRendering")));
++
++        var renderStart = code.IndexOf("private void OnFirstRendering", StringComparison.Ordinal);
++        var readyStart = code.IndexOf("private bool IsPresentationReady", StringComparison.Ordinal);
++        var fenceStart = code.IndexOf("private void CompletePresentationFence", StringComparison.Ordinal);
++        var failStart = code.IndexOf("private void FailPresentation", StringComparison.Ordinal);
++        var render = code.Substring(renderStart, readyStart - renderStart);
++        var readiness = code.Substring(readyStart, fenceStart - readyStart);
++        var fence = code.Substring(fenceStart, failStart - fenceStart);
++        Assert.Contains("!IsPresentationReady()", render);
++        Assert.Contains("DispatcherQueue.TryEnqueue(CompletePresentationFence)", render);
++        Assert.DoesNotContain("ArmAllowGuard();", render);
++        Assert.Contains("_showRequested", readiness);
++        Assert.Contains("_windowContent.IsLoaded", readiness);
++        Assert.Contains("_windowContent.ActualWidth <= 0", readiness);
++        Assert.Contains("_windowContent.ActualHeight <= 0", readiness);
++        Assert.Contains("IsWindowVisible(hwnd)", readiness);
++        Assert.True(fence.IndexOf("DwmFlush() != 0", StringComparison.Ordinal)
++            < fence.IndexOf("ArmAllowGuard();", StringComparison.Ordinal));
++        Assert.Contains("DwmFlush() != 0 || !IsPresentationReady()", fence);
++        Assert.Contains("FailPresentation();", fence);
++        Assert.Contains("_outcome = ExecApprovalPromptOutcome.Unavailable;", code);
++
++        var guardStart = code.IndexOf("private void ArmAllowGuard", StringComparison.Ordinal);
++        var seenStart = code.IndexOf("private void UpdateCommandSeen", StringComparison.Ordinal);
++        var guard = code.Substring(guardStart, seenStart - guardStart);
++        Assert.True(guard.IndexOf("_armClock.Restart();", StringComparison.Ordinal)
++            < guard.IndexOf("_armTimer.Start();", StringComparison.Ordinal));
++        Assert.Contains("DecisionArmDelay - _armClock.Elapsed", guard);
++        Assert.True(guard.IndexOf("if (remaining > TimeSpan.Zero)", StringComparison.Ordinal)
++            < guard.IndexOf("_delayElapsed = true;", StringComparison.Ordinal));
 +        Assert.Equal(3, System.Text.RegularExpressions.Regex.Matches(code, "IsEnabled = false").Count);
 +        Assert.Contains("if (IsClosed || !_delayElapsed) return;", code);
 +        Assert.Contains("outcome != ExecApprovalPromptOutcome.Deny && !_commandFullySeen", code);
