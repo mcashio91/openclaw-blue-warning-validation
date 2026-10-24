@@ -94,14 +94,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $bLog = Join-Path $env:RUNNER_TEMP 'upstream-build.log'
-          ./build.ps1 -Project All -Configuration Release -NoTrustRepository | Tee-Object -FilePath $bLog
+          # build.ps1 reports its summary with Write-Host (information stream).
+          # Capture all streams so a successful build cannot leave the log absent.
+          & ./build.ps1 -Project All -Configuration Release -NoTrustRepository *>&1 | Tee-Object -FilePath $bLog
           $bCode = $LASTEXITCODE
           $bText = Get-Content $bLog -Raw
-          $bErr = [regex]::Matches($bText, '(\d+) Error\(s\)') | Select-Object -Last 1
-          $bWarn = [regex]::Matches($bText, '(\d+) Warning\(s\)') | Select-Object -Last 1
-          $bOk = [regex]::IsMatch($bText, 'Build succeeded')
-          Write-Host "::notice title=Upstream build::exit=$bCode succeeded=$bOk errors=$($bErr.Groups[1].Value) warnings=$($bWarn.Groups[1].Value)"
-          if ($null -ne $bCode -and $bCode -ne 0) { throw "Upstream build failed: exit=$bCode" }
+          $bOk = [regex]::IsMatch($bText, 'All builds succeeded!')
+          $built = @('Shared', 'Cli', 'WinNodeCli', 'SetupEngine', 'WinUI')
+          foreach ($project in $built) {
+            if (-not $bText.Contains("$project built successfully")) { throw "Missing upstream build success: $project" }
+          }
+          Write-Host "::notice title=Upstream build::exit=$bCode succeeded=$bOk projects=$($built.Count); compiler warning/error totals are not emitted by build.ps1"
+          if (($null -ne $bCode -and $bCode -ne 0) -or -not $bOk) { throw "Upstream build failed: exit=$bCode succeeded=$bOk" }
       - name: Shared tests
         shell: pwsh
         working-directory: source
